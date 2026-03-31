@@ -28,10 +28,11 @@ from mshab.utils.label_dataset import get_episode_label_and_events
 from mshab.utils.logger import Logger, LoggerConfig
 from mshab.utils.time import NonOverlappingTimeProfiler
 
-
-NUM_ENVS = 252
+# 最好是 63 的倍数，记录视频则尽可能小如 4
+NUM_ENVS = 63
 SEED = 2024
-MAX_TRAJECTORIES = 1000
+# 收集 NUM_ENVS * MAX_TRAJECTORIES 条轨迹
+MAX_TRAJECTORIES = 1
 
 SAVE_TRAJECTORIES = True
 SAVE_GRASP_POSE = False
@@ -127,7 +128,8 @@ def eval(
         ),
     )
     logger_cfg = LoggerConfig(
-        workspace="mshab_exps",
+        ### 日志与轨迹的保存路径
+        workspace="/mnt/dataset/xzmyuq/dataset/mshab_custom_trajectory",
         exp_name=(
             (
                 f"gen_data_save_trajectories/{task}/{subtask}/{split}/{obj_name}"
