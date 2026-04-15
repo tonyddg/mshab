@@ -48,18 +48,32 @@ from mshab.utils.array import (
 )
 
 from mani_skill.utils.geometry import rotation_conversions
+
 # 末端连杆名称
 FETCH_TCP_LINK_NAME = "gripper_link"
 # 移动底盘所在连杆名称
 FETCH_BASE_LINK_NAME = "base_link"
 # 夹爪最大行程
 FETCH_GRIPPER_OPEN_QPOS = 0.050
+# 夹爪关节在 Sapien 标准 QPOS 中的索引
+FETCH_GRIPPER_QPOS_IDX = [13, 14]
 
 UNIQUE_SUCCESS_SUBTASK_TYPE = 100
 GOAL_POSE_Q = transforms3d.quaternions.axangle2quat(
     np.array([0, 1, 0]), theta=np.deg2rad(90)
 )
 
+##### 辅助函数 #####
+
+def quaternion_to_rpy_eular(quat: torch.Tensor):
+    # 转为 RPY 角
+    rot_matrix = rotation_conversions.quaternion_to_matrix(quat)
+    # 固定坐标系下的 XYZ 欧拉角 (matrix_to_euler_angles 使用的是运动坐标系, 要传 ZYX 再反序)
+    rot_rpy = rotation_conversions.matrix_to_euler_angles(rot_matrix, "ZYX")
+    rot_rpy = torch.flip(rot_rpy, dims = [1, ])
+    return rot_rpy
+
+##### 辅助函数 #####
 
 @register_env("SequentialTask-v0")
 class SequentialTaskEnv(SceneManipulationEnv):
@@ -748,7 +762,16 @@ class SequentialTaskEnv(SceneManipulationEnv):
             ].horizon
 
             self.resting_qpos = torch.tensor(self.agent.keyframes["rest"].qpos[3:-2])
-            ### 用于转化 OpenVLA 标准动作
+            # ### 用于转化 Pi0 标准动作
+
+            # GPU sim 下显式同步
+            if self.gpu_sim_enabled:
+                # 某些版本文档写的是 gpu_apply_all / gpu_fetch_all，
+                # 但官方示例里常见的是带下划线的方法
+                self.scene._gpu_apply_all()
+                self.scene.px.gpu_update_articulation_kinematics()
+                self.scene._gpu_fetch_all()
+
             # 初始化位姿张量
             if not hasattr(self, "last_base_pose_raw"):
                 self.last_base_pose_raw = torch.zeros((self.num_envs, 7))
@@ -760,6 +783,9 @@ class SequentialTaskEnv(SceneManipulationEnv):
                 self.last_tcp_pose_raw = torch.zeros((self.num_envs, 7))
             # 保存上一步世界坐标系下的 TCP 位姿 (_initialize_episode 自动过滤)
             self.last_tcp_pose_raw[env_idx] = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose.raw_pose
+
+            # 缓存上一步夹爪状态
+            self.gripper_state_tl = self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX[0]] / FETCH_GRIPPER_OPEN_QPOS
 
     # -------------------------------------------------------------------------------------------------
 
@@ -872,39 +898,51 @@ class SequentialTaskEnv(SceneManipulationEnv):
         )
         subtask_type[~success] = self.task_ids[self.subtask_pointer[~success]]
 
-        ### 转化为 OpenVLA 标准动作
-        ## OpenVLA 的动作输出（Action Chunk）主要基于 机器人末端执行器（TCP）相对于当前位置的增量控制。
-        ## 在 6DoF 的旋转表示上，固定轴（Extrinsic）XYZ 欧拉角
-        ## 移动操作中，世界坐标系设为当前时刻的基座坐标系
-        # 记录 t-1 时刻动作的 TCP 增量表示 (变量命名中使用 tm 表示 t-1)
-        w_btm_pose = Pose(self.last_base_pose_raw)
-        w_t_pose_tm = Pose(self.last_tcp_pose_raw)
-        w_bt_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
-        w_t_pose_t = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
-        # 将观测坐标系转为 t-1 时刻的基座坐标系
-        btm_w_pose = w_btm_pose.inv()
-        btm_t_pose_tm = btm_w_pose * w_t_pose_tm
-        btm_t_pose_t = btm_w_pose * w_t_pose_t
-        btm_trans_ttm = btm_t_pose_t * btm_t_pose_tm.inv()
-        # 更新记录
-        self.last_base_pose_raw = w_bt_pose.raw_pose
-        self.last_tcp_pose_raw = w_t_pose_t.raw_pose
-        # 转为 RPY 角
-        btm_trans_ttm_rot_matrix = rotation_conversions.quaternion_to_matrix(btm_trans_ttm.get_q())
-        # 固定坐标系下的 XYZ 欧拉角 (matrix_to_euler_angles 使用的是运动坐标系, 要传 XYZ 再反序)
-        btm_trans_ttm_rot_rpy = rotation_conversions.matrix_to_euler_angles(btm_trans_ttm_rot_matrix, "ZYX")
-        btm_trans_ttm_rot_rpy = torch.flip(btm_trans_ttm_rot_rpy, dims = [1, ])
-        # 记录夹爪 (+1=open, 0=close)
-        gripper_state = torch.zeros((self.num_envs, 1), device = self.device)
-        gripper_state[self.agent.robot.get_qpos()[:, -1] > (FETCH_GRIPPER_OPEN_QPOS / 2)] = 1
-        # 拼接动作三个部分
-        action_delta_eef = torch.concat(
-            [btm_trans_ttm.get_p(), btm_trans_ttm_rot_rpy, gripper_state], dim = 1
+        ### 转化为 Pi0 标准动作
+        ## TODO: 第一帧数据无效需要排除
+
+        ## 本体观测：移动底盘坐标系下的末端位置、四元数姿态、当前夹爪张开程度（tl: 上一时刻, tc：当前时刻）
+        w_b_tl_pose = Pose(self.last_base_pose_raw)
+        w_eef_tl_pose = Pose(self.last_tcp_pose_raw)
+        b_tl_w_pose = w_b_tl_pose.inv()
+        # 上一时刻基座下的末端执行器作为状态
+        b_tl_eef_tl_pose = b_tl_w_pose * w_eef_tl_pose
+        # 整理为 Pi0 本体观测
+        # print(f"self.gripper_state_tl: {self.gripper_state_tl.shape}")
+        # print(f"b_tl_eef_tl_pose.get_p(): {b_tl_eef_tl_pose.get_p().shape}") 
+        pi0_eef_state = torch.concat(
+            [b_tl_eef_tl_pose.get_p(), b_tl_eef_tl_pose.get_q(), self.gripper_state_tl.unsqueeze(dim = 1)], dim = 1
         )
-        # print(f"w_t_pose_tm: {w_t_pose_tm.get_p()}")
-        # print(f"w_t_pose_t: {w_t_pose_t.get_p()}")
-        # print(f"btm_t_pose_tm: {btm_t_pose_tm.get_p()}")
-        # print(f"btm_t_pose_t: {btm_t_pose_t.get_p()}")
+
+        ## 动作：移动底盘坐标系下的末端位移变换（位置 + 固定欧拉角）+ 下一时刻夹爪张开程度
+        w_b_tc_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
+        w_eef_tc_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose     
+        # 获取当前夹爪状态
+        gripper_state_tc = self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX[0]] / FETCH_GRIPPER_OPEN_QPOS
+        # 更新记录
+        self.last_base_pose_raw = w_b_tc_pose.raw_pose
+        self.last_tcp_pose_raw = w_eef_tc_pose.raw_pose
+        self.gripper_state_tl = gripper_state_tc
+
+        # 获取基于运动坐标系的 Delta 动作
+        eef_tl_trans = w_eef_tl_pose.inv() * w_eef_tc_pose
+        # 整理为 Pi0 动作
+        pi0_eef_ref_action = torch.concat(
+            [eef_tl_trans.get_p(), quaternion_to_rpy_eular(eef_tl_trans.get_q()), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+        )
+
+        # 获取基于基座坐标系的 Delta 动作
+        b_tl_eef_tc_pose = b_tl_w_pose * w_eef_tc_pose
+        b_tl_trans = b_tl_eef_tc_pose * b_tl_eef_tl_pose.inv()
+        # 整理为 Pi0 动作
+        pi0_eef_abs_action = torch.concat(
+            [b_tl_trans.get_p(), quaternion_to_rpy_eular(b_tl_trans.get_q()), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+        )
+
+        # print(f"b_tl_eef_tl_pose: {b_tl_eef_tl_pose.get_p()}")
+        # print(f"pi0_eef_state: {pi0_eef_state}")
+        # print(f"pi0_eef_ref_action: {pi0_eef_ref_action}")
+        # print(f"pi0_eef_abs_action: {pi0_eef_abs_action}")
 
         return dict(
             success=success,
@@ -918,7 +956,9 @@ class SequentialTaskEnv(SceneManipulationEnv):
             **progressive_task_checkers,
 
             # 自定义信息
-            action_delta_eef = action_delta_eef
+            pi0_eef_state = pi0_eef_state,
+            pi0_eef_ref_action = pi0_eef_ref_action,
+            pi0_eef_abs_action = pi0_eef_abs_action,
         )
 
     def _progressive_task_check_success(self):
@@ -1575,6 +1615,10 @@ class SequentialTaskEnv(SceneManipulationEnv):
             obj_pose_wrt_base=obj_pose_wrt_base,
             goal_pos_wrt_base=goal_pos_wrt_base,
             is_grasped=is_grasped,
+
+            # pi0_eef_state = info["pi0_eef_state"],
+            # pi0_eef_ref_action = info["pi0_eef_ref_action"],
+            # pi0_eef_abs_action = info["pi0_eef_abs_action"],
         )
 
     # -------------------------------------------------------------------------------------------------
