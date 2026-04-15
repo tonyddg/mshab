@@ -29,10 +29,10 @@ from mshab.utils.logger import Logger, LoggerConfig
 from mshab.utils.time import NonOverlappingTimeProfiler
 
 # 最好是 63 的倍数，记录视频则尽可能小如 4
-NUM_ENVS = 63
+NUM_ENVS = 252
 SEED = 2024
-# 收集 NUM_ENVS * MAX_TRAJECTORIES 条轨迹
-MAX_TRAJECTORIES = 1
+# 收集 MAX_TRAJECTORIES 条轨迹，仅成功的轨迹会被保留, 可以取约 NUM_ENVS * 0.6
+MAX_TRAJECTORIES = 300
 
 SAVE_TRAJECTORIES = True
 SAVE_GRASP_POSE = False
