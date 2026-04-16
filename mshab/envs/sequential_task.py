@@ -1,11 +1,13 @@
 import copy
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from warnings import warn
 
 import numpy as np
 import torch
 import torch.random
 import transforms3d
+from transforms3d.euler import euler2quat
 
 import sapien
 
@@ -57,6 +59,10 @@ FETCH_BASE_LINK_NAME = "base_link"
 FETCH_GRIPPER_OPEN_QPOS = 0.050
 # 夹爪关节在 Sapien 标准 QPOS 中的索引
 FETCH_GRIPPER_QPOS_IDX = [13, 14]
+# 与原版的 Fetch 存在不同, 可能需要同步到原版的 Fetch
+FETCH_HEAD_CAMERA_LINK = "head_camera_link"
+FETCH_GRIPPER_CAMERA_LINK = "gripper_link"
+FETCH_FORWARD_IN_BASE_LINK: np.ndarray = np.array([1.0, 0])
 
 UNIQUE_SUCCESS_SUBTASK_TYPE = 100
 GOAL_POSE_Q = transforms3d.quaternions.axangle2quat(
@@ -91,7 +97,279 @@ class SequentialTaskEnv(SceneManipulationEnv):
     Visualization: link to a video/gif of the task being solved
     """
 
-    SUPPORTED_ROBOTS = ["fetch"]
+    ### Pi0
+
+    def _pi0_initalize_episode(self, env_idx: torch.Tensor, options):
+        # GPU sim 下显式同步
+        if self.gpu_sim_enabled:
+            # 某些版本文档写的是 gpu_apply_all / gpu_fetch_all，
+            # 但官方示例里常见的是带下划线的方法
+            self.scene._gpu_apply_all()
+            self.scene.px.gpu_update_articulation_kinematics()
+            self.scene._gpu_fetch_all()
+
+        # 初始化位姿张量
+        if not hasattr(self, "last_base_pose_raw"):
+            self.last_base_pose_raw = torch.zeros((self.num_envs, 7))
+        # 保存上一步世界坐标系下的底盘位姿 (_initialize_episode 自动过滤)
+        self.last_base_pose_raw[env_idx] = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose.raw_pose
+
+        # 初始化位姿张量
+        if not hasattr(self, "last_tcp_pose_raw"):
+            self.last_tcp_pose_raw = torch.zeros((self.num_envs, 7))
+        # 保存上一步世界坐标系下的 TCP 位姿 (_initialize_episode 自动过滤)
+        self.last_tcp_pose_raw[env_idx] = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose.raw_pose
+
+        # 缓存上一步夹爪状态
+        self.gripper_state_tl = self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX[0]] / FETCH_GRIPPER_OPEN_QPOS
+
+    def _pi0_evaluate(self):
+        ### 转化为 Pi0 标准动作
+        ## TODO: 第一帧数据无效需要排除
+
+        ## 本体观测：移动底盘坐标系下的末端位置、四元数姿态、当前夹爪张开程度（tl: 上一时刻, tc：当前时刻）
+        w_b_tl_pose = Pose(self.last_base_pose_raw)
+        w_eef_tl_pose = Pose(self.last_tcp_pose_raw)
+        b_tl_w_pose = w_b_tl_pose.inv()
+        # 上一时刻基座下的末端执行器作为状态
+        b_tl_eef_tl_pose = b_tl_w_pose * w_eef_tl_pose
+        # 整理为 Pi0 本体观测 (LeRobot 使用的是动作执行前的观测, Evaluate 直接获取的为动作执行后的状态, 因此此处使用 tl)
+        # print(f"self.gripper_state_tl: {self.gripper_state_tl.shape}")
+        # print(f"b_tl_eef_tl_pose.get_p(): {b_tl_eef_tl_pose.get_p().shape}") 
+        pi0_eef_state_tl = torch.concat(
+            [b_tl_eef_tl_pose.get_p(), b_tl_eef_tl_pose.get_q(), self.gripper_state_tl.unsqueeze(dim = 1)], dim = 1
+        )
+
+        # 获取当前底盘与夹爪末端位姿
+        w_b_tc_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
+        w_eef_tc_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose   
+
+        # 获取当前夹爪状态
+        gripper_state_tc = self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX[0]] / FETCH_GRIPPER_OPEN_QPOS
+
+        # 非推理模式下将收集动作, 使用 s_{t-1} 状态
+        if not self.pi0_is_infer_mode:
+            # 动作：移动底盘坐标系下的末端位移变换（位置 + 固定欧拉角）+ 下一时刻夹爪张开程度
+            # 获取基于运动坐标系的 Delta 动作
+            eef_tl_trans = w_eef_tl_pose.inv() * w_eef_tc_pose
+            # 整理为 Pi0 动作
+            pi0_eef_ref_action = torch.concat(
+                [eef_tl_trans.get_p(), quaternion_to_rpy_eular(eef_tl_trans.get_q()), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+            )
+
+            # 获取基于基座坐标系的 Delta 动作
+            b_tl_eef_tc_pose = b_tl_w_pose * w_eef_tc_pose
+            b_tl_trans = b_tl_eef_tc_pose * b_tl_eef_tl_pose.inv()
+            # 整理为 Pi0 动作
+            pi0_eef_abs_action = torch.concat(
+                [b_tl_trans.get_p(), quaternion_to_rpy_eular(b_tl_trans.get_q()), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+            )
+
+            res_info = dict(
+                pi0_eef_state = pi0_eef_state_tl,
+                pi0_eef_ref_action = pi0_eef_ref_action,
+                pi0_eef_abs_action = pi0_eef_abs_action,
+            )
+        else:
+        # 推理模式下使用 s_t 状态, 动作赋为 None
+
+            # 整理为当前时刻的 pi0 本体观测
+            b_tc_eef_tc_pose = w_b_tc_pose.inv() * w_eef_tc_pose
+            pi0_eef_state_tc = torch.concat(
+                [b_tc_eef_tc_pose.get_p(), b_tc_eef_tc_pose.get_q(), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+            )
+
+            res_info = dict(
+                pi0_eef_state = pi0_eef_state_tc,
+                pi0_eef_ref_action = None,
+                pi0_eef_abs_action = None,
+            )
+
+        # 更新记录
+        self.last_base_pose_raw = w_b_tc_pose.raw_pose
+        self.last_tcp_pose_raw = w_eef_tc_pose.raw_pose
+        self.gripper_state_tl = gripper_state_tc
+        return res_info
+
+    ### policy
+
+    def set_policy_goal_pose(
+        self,
+        # 传入位姿均相对世界坐标系
+        new_pose: Optional[Union[Pose, Literal[
+            "tcp", # 当前 TCP 位姿
+            "goal", # 子任务目标位姿
+            "reset" # 任务结束位姿
+        ]]] = None,
+        env_idx: int = 0
+    ):
+        if not isinstance(new_pose, Pose):
+            if new_pose == "tcp" or new_pose == None:
+                use_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
+            else:
+                raise NotImplemented("尚未实现引用其他位姿")
+        else:
+            use_pose = new_pose
+
+        origin_pose = self.goal_point.pose
+        origin_pose.raw_pose[env_idx] = use_pose.raw_pose[0]
+        self.goal_point.set_pose(origin_pose)
+
+    def get_policy_goal_pose(
+        self
+    ):
+        return self.goal_point.pose
+
+    GOAL_POINT_VIS_RADIUS = 0.01
+    GOAL_POINT_VIS_LENGTH = 0.05
+    GOAL_POINT_VIS_COLOR = (np.array([12, 160, 42], dtype = np.float64) / 255).tolist()
+    def _policy_load_scene(self, options):
+
+        # 目标识别体
+        goal_point_builder = self.scene.create_actor_builder()
+        
+        if self.policy_show_goal_axis:
+            goal_point_builder.add_cylinder_visual(
+                radius = self.GOAL_POINT_VIS_RADIUS,
+                half_length = self.GOAL_POINT_VIS_LENGTH,
+                material = (1, 0, 0),
+                pose = sapien.Pose(p = [self.GOAL_POINT_VIS_LENGTH, 0, 0])
+            )
+            goal_point_builder.add_cylinder_visual(
+                radius = self.GOAL_POINT_VIS_RADIUS,
+                half_length = self.GOAL_POINT_VIS_LENGTH,
+                material = (0, 1, 0),
+                pose = sapien.Pose(p = [0, self.GOAL_POINT_VIS_LENGTH, 0], q = np.asarray(euler2quat(0, 0, np.deg2rad(-90)), dtype = np.float32))
+            )
+            goal_point_builder.add_cylinder_visual(
+                radius = self.GOAL_POINT_VIS_RADIUS,
+                half_length = self.GOAL_POINT_VIS_LENGTH,
+                material = (0, 0, 1),
+                pose = sapien.Pose(p = [0, 0, self.GOAL_POINT_VIS_LENGTH], q = np.asarray(euler2quat(0, np.deg2rad(90), 0), dtype = np.float32))
+            )
+        else:
+            goal_point_builder.add_cylinder_visual(
+                radius = self.GOAL_POINT_VIS_RADIUS,
+                half_length = self.GOAL_POINT_VIS_LENGTH,
+                material = self.GOAL_POINT_VIS_COLOR,
+                pose = sapien.Pose(p = [0, 0, 0])
+            )
+
+        goal_point_builder.set_initial_pose(sapien.Pose(p = [0, 0, 0], q = [1, 0, 0, 0]))
+        self.goal_point = goal_point_builder.build_kinematic(name = "goal_point")
+        self._hidden_objects.append(self.goal_point)
+
+        # 末端指示体
+        if self.policy_show_goal_axis:
+            tcp_point_builder = self.scene.create_actor_builder()
+        
+            tcp_point_builder.add_cylinder_visual(
+                radius = self.GOAL_POINT_VIS_RADIUS,
+                half_length = self.GOAL_POINT_VIS_LENGTH,
+                material = (1, 0, 0),
+                pose = sapien.Pose(p = [self.GOAL_POINT_VIS_LENGTH, 0, 0])
+            )
+            tcp_point_builder.add_cylinder_visual(
+                radius = self.GOAL_POINT_VIS_RADIUS,
+                half_length = self.GOAL_POINT_VIS_LENGTH,
+                material = (0, 1, 0),
+                pose = sapien.Pose(p = [0, self.GOAL_POINT_VIS_LENGTH, 0], q = np.asarray(euler2quat(0, 0, np.deg2rad(-90)), dtype = np.float32))
+            )
+            tcp_point_builder.add_cylinder_visual(
+                radius = self.GOAL_POINT_VIS_RADIUS,
+                half_length = self.GOAL_POINT_VIS_LENGTH,
+                material = (0, 0, 1),
+                pose = sapien.Pose(p = [0, 0, self.GOAL_POINT_VIS_LENGTH], q = np.asarray(euler2quat(0, np.deg2rad(90), 0), dtype = np.float32))
+            )
+
+            tcp_point_builder.set_initial_pose(sapien.Pose(p = [0, 0, 0], q = [1, 0, 0, 0]))
+            self.tcp_point = tcp_point_builder.build_kinematic(name = "tcp_point")
+            self._hidden_objects.append(self.tcp_point)
+
+        else:
+            self.tcp_point = None
+
+    def _policy_initalize_episode(self, env_idx: torch.Tensor, options):
+        with torch.device(self.device):
+            with torch.no_grad():
+                # 新重置的环境上一步动作为 0
+                if not hasattr(self, "last_action"):
+                    self.last_action = torch.zeros((self.num_envs, self.agent.robot.max_dof))
+                else:
+                    # 假定 step 均为 Tensor
+                    self.last_action[env_idx] = 0
+
+    def _policy_evaluate(self):
+        
+        ### 角度检查
+        tcp_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
+        # 计算位姿差必须是 TA-1 TB, 且 A B 有同一个观察坐标系 !!!
+        pose_diff = tcp_pose.inv() * self.goal_point.pose # type: ignore
+        assert isinstance(pose_diff, Pose)
+
+        # 使用世界坐标系下的差向量而不是末端或目标
+        loc_diff = tcp_pose.get_p() - self.goal_point.pose.get_p()
+        rotvec_diff = rotation_conversions.quaternion_to_axis_angle(pose_diff.get_q())
+        rot_error = torch.norm(rotvec_diff, dim = 1)
+        loc_error = torch.norm(loc_diff, dim = 1)
+
+        ### 底盘信息
+        base_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
+        base_T = base_pose.to_transformation_matrix()
+        
+        if not hasattr(self, "robot_forward_in_base_link_tensor"):
+            self.robot_forward_in_base_link_tensor = torch.as_tensor(
+                FETCH_FORWARD_IN_BASE_LINK, dtype = torch.float32,
+                device = self.device
+            )
+        # 认为底盘紧贴底面, z 分量为 (0, 0, 1)
+        base_forward = base_T[:, :2, :2] @ self.robot_forward_in_base_link_tensor
+
+        base_loc = base_T[:, 0:2, 3]
+        goal_loc = self.goal_point.pose.get_p()[:, 0:2]
+        base2goal_vec = torch.as_tensor(goal_loc - base_loc)
+
+        ### 相机位姿
+        base_world_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose.inv()
+        # 头部相机坐标系在基座下的座标系
+        world_head_camera_pose = self.agent.robot.find_link_by_name(FETCH_HEAD_CAMERA_LINK).pose
+        # 手部相机坐标系在基座下的坐标系
+        world_gripper_camera_pose = self.agent.robot.find_link_by_name(FETCH_GRIPPER_CAMERA_LINK).pose
+        
+        addition_info = dict(
+            
+            # MSHAB 对原始 qpos 进行了裁剪, 此处重新获取原始 qpos 便于与已有模块衔接
+            qpos = self.agent.robot.get_qpos(),
+
+            rot_error = rot_error,
+            loc_error = loc_error,
+            
+            loc_diff = loc_diff,
+            rotvec_diff = rotvec_diff,
+
+            base_forward = base_forward,
+            base2goal_vec = base2goal_vec,
+
+            last_action = self.last_action if self.last_action is not None else torch.zeros((self.num_envs, self.agent.robot.max_dof)),
+
+            head_camera_t = (base_world_pose * world_head_camera_pose).to_transformation_matrix(),
+            gripper_camera_t = (base_world_pose * world_gripper_camera_pose).to_transformation_matrix(),
+        )
+        return addition_info
+
+    def get_reward(self, obs: Any, action: torch.Tensor, info: Dict):
+        reward = super().get_reward(obs, action, info)
+        # 更新 TCP 指示器
+        if self.policy_info_enable:
+            if self.tcp_point is not None:
+                self.tcp_point.set_pose(self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose)
+            # 更新上一时刻动作
+            self.last_action = action
+        return reward
+    
+    ###
+
+    SUPPORTED_ROBOTS = ["fetch", "fetch_modified"]
     agent: Fetch
 
     EE_REST_POS_WRT_BASE = (0.5, 0, 1.25)
@@ -146,8 +424,41 @@ class SequentialTaskEnv(SceneManipulationEnv):
         add_event_tracker_info=False,
         invisible_goals_in_human_render=False,
         task_cfgs=dict(),
+
+        # 启用 pi0 数据集所需的 info
+        pi0_info_enable: bool = True,
+        # 将 pi0 信息合并到 extra obs 中
+        pi0_info_merge_to_extra_obs: bool = False,
+        # 推理模式下, 不分析动作, 且输出状态为动作执行后的状态
+        pi0_is_infer_mode: bool = False,
+
+        # 启用 RL Policy 所需的 info
+        policy_info_enable: bool = False,
+        # 将 RL policy 信息合并到 extra obs 中
+        policy_info_merge_to_extra_obs: bool = False,
+        # 显示末端与目标的坐标系
+        policy_show_goal_axis: bool = True,
+
+        # TODO: 自定义结束位姿
+        custom_reset_ee_pose: Optional[Pose] = None,
+
         **kwargs,
     ):
+        
+        self.pi0_info_enable = pi0_info_enable
+        self.pi0_is_infer_mode = pi0_is_infer_mode
+        self.pi0_info_merge_to_extra_obs = pi0_info_merge_to_extra_obs
+        if (not self.pi0_info_enable) and self.pi0_info_merge_to_extra_obs:
+            warn("将 pi0 信息合并到 extra obs 前需要启用 pi0_info_enable")
+            self.pi0_info_merge_to_extra_obs = False
+        
+        self.policy_info_enable = policy_info_enable
+        self.policy_show_goal_axis = policy_show_goal_axis
+        self.policy_info_merge_to_extra_obs = policy_info_merge_to_extra_obs
+        if (not self.policy_info_enable) and self.policy_info_merge_to_extra_obs:
+            warn("将 policy 信息合并到 extra obs 前需要启用 policy_info_enable")
+            self.policy_info_merge_to_extra_obs = False
+        
         self.task_cfgs: Dict[str, SubtaskConfig] = dict(
             pick=self.pick_cfg,
             place=self.place_cfg,
@@ -724,6 +1035,9 @@ class SequentialTaskEnv(SceneManipulationEnv):
             name="ee_rest_goal",
             goal_type="sphere",
         )
+        ### 用于 RL 策略
+        if self.policy_info_enable:
+            self._policy_load_scene(options)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options):
         with torch.device(self.device):
@@ -762,30 +1076,13 @@ class SequentialTaskEnv(SceneManipulationEnv):
             ].horizon
 
             self.resting_qpos = torch.tensor(self.agent.keyframes["rest"].qpos[3:-2])
-            # ### 用于转化 Pi0 标准动作
 
-            # GPU sim 下显式同步
-            if self.gpu_sim_enabled:
-                # 某些版本文档写的是 gpu_apply_all / gpu_fetch_all，
-                # 但官方示例里常见的是带下划线的方法
-                self.scene._gpu_apply_all()
-                self.scene.px.gpu_update_articulation_kinematics()
-                self.scene._gpu_fetch_all()
-
-            # 初始化位姿张量
-            if not hasattr(self, "last_base_pose_raw"):
-                self.last_base_pose_raw = torch.zeros((self.num_envs, 7))
-            # 保存上一步世界坐标系下的底盘位姿 (_initialize_episode 自动过滤)
-            self.last_base_pose_raw[env_idx] = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose.raw_pose
-
-            # 初始化位姿张量
-            if not hasattr(self, "last_tcp_pose_raw"):
-                self.last_tcp_pose_raw = torch.zeros((self.num_envs, 7))
-            # 保存上一步世界坐标系下的 TCP 位姿 (_initialize_episode 自动过滤)
-            self.last_tcp_pose_raw[env_idx] = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose.raw_pose
-
-            # 缓存上一步夹爪状态
-            self.gripper_state_tl = self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX[0]] / FETCH_GRIPPER_OPEN_QPOS
+            ### 用于转化 Pi0 标准动作
+            if self.pi0_info_enable:
+                self._pi0_initalize_episode(env_idx, options)
+            ### 用于 RL 策略
+            if self.policy_info_enable:
+                self._policy_initalize_episode(env_idx, options)
 
     # -------------------------------------------------------------------------------------------------
 
@@ -898,53 +1195,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         )
         subtask_type[~success] = self.task_ids[self.subtask_pointer[~success]]
 
-        ### 转化为 Pi0 标准动作
-        ## TODO: 第一帧数据无效需要排除
-
-        ## 本体观测：移动底盘坐标系下的末端位置、四元数姿态、当前夹爪张开程度（tl: 上一时刻, tc：当前时刻）
-        w_b_tl_pose = Pose(self.last_base_pose_raw)
-        w_eef_tl_pose = Pose(self.last_tcp_pose_raw)
-        b_tl_w_pose = w_b_tl_pose.inv()
-        # 上一时刻基座下的末端执行器作为状态
-        b_tl_eef_tl_pose = b_tl_w_pose * w_eef_tl_pose
-        # 整理为 Pi0 本体观测
-        # print(f"self.gripper_state_tl: {self.gripper_state_tl.shape}")
-        # print(f"b_tl_eef_tl_pose.get_p(): {b_tl_eef_tl_pose.get_p().shape}") 
-        pi0_eef_state = torch.concat(
-            [b_tl_eef_tl_pose.get_p(), b_tl_eef_tl_pose.get_q(), self.gripper_state_tl.unsqueeze(dim = 1)], dim = 1
-        )
-
-        ## 动作：移动底盘坐标系下的末端位移变换（位置 + 固定欧拉角）+ 下一时刻夹爪张开程度
-        w_b_tc_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
-        w_eef_tc_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose     
-        # 获取当前夹爪状态
-        gripper_state_tc = self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX[0]] / FETCH_GRIPPER_OPEN_QPOS
-        # 更新记录
-        self.last_base_pose_raw = w_b_tc_pose.raw_pose
-        self.last_tcp_pose_raw = w_eef_tc_pose.raw_pose
-        self.gripper_state_tl = gripper_state_tc
-
-        # 获取基于运动坐标系的 Delta 动作
-        eef_tl_trans = w_eef_tl_pose.inv() * w_eef_tc_pose
-        # 整理为 Pi0 动作
-        pi0_eef_ref_action = torch.concat(
-            [eef_tl_trans.get_p(), quaternion_to_rpy_eular(eef_tl_trans.get_q()), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
-        )
-
-        # 获取基于基座坐标系的 Delta 动作
-        b_tl_eef_tc_pose = b_tl_w_pose * w_eef_tc_pose
-        b_tl_trans = b_tl_eef_tc_pose * b_tl_eef_tl_pose.inv()
-        # 整理为 Pi0 动作
-        pi0_eef_abs_action = torch.concat(
-            [b_tl_trans.get_p(), quaternion_to_rpy_eular(b_tl_trans.get_q()), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
-        )
-
-        # print(f"b_tl_eef_tl_pose: {b_tl_eef_tl_pose.get_p()}")
-        # print(f"pi0_eef_state: {pi0_eef_state}")
-        # print(f"pi0_eef_ref_action: {pi0_eef_ref_action}")
-        # print(f"pi0_eef_abs_action: {pi0_eef_abs_action}")
-
-        return dict(
+        origin_info = dict(
             success=success,
             fail=fail,
             subtask=self.subtask_pointer,
@@ -954,12 +1205,18 @@ class SequentialTaskEnv(SceneManipulationEnv):
             robot_cumulative_force=self.robot_cumulative_force,
             **success_checkers,
             **progressive_task_checkers,
-
-            # 自定义信息
-            pi0_eef_state = pi0_eef_state,
-            pi0_eef_ref_action = pi0_eef_ref_action,
-            pi0_eef_abs_action = pi0_eef_abs_action,
         )
+
+        ### 转化为 Pi0 标准动作
+        if self.pi0_info_enable:
+            pi0_info = self._pi0_evaluate()
+            origin_info.update(pi0_info)
+
+        if self.policy_info_enable:
+            policy_info = self._policy_evaluate()
+            origin_info.update(policy_info)
+
+        return origin_info
 
     def _progressive_task_check_success(self):
         # check if prior tasks are still in completion state
@@ -1610,16 +1867,40 @@ class SequentialTaskEnv(SceneManipulationEnv):
         #       - is_grasped    :   part of success criteria (or set default)
         is_grasped = info["is_grasped"]
 
-        return dict(
+        origin_extra_obs = dict(
             tcp_pose_wrt_base=tcp_pose_wrt_base,
             obj_pose_wrt_base=obj_pose_wrt_base,
             goal_pos_wrt_base=goal_pos_wrt_base,
             is_grasped=is_grasped,
-
-            # pi0_eef_state = info["pi0_eef_state"],
-            # pi0_eef_ref_action = info["pi0_eef_ref_action"],
-            # pi0_eef_abs_action = info["pi0_eef_abs_action"],
         )
+    
+        ###
+        if self.pi0_info_merge_to_extra_obs and self.pi0_info_enable:
+            origin_extra_obs.update(dict(
+                pi0_eef_state = info["pi0_eef_state"],
+                pi0_eef_ref_action = info["pi0_eef_ref_action"],
+                pi0_eef_abs_action = info["pi0_eef_abs_action"],
+            ))
+        if self.policy_info_merge_to_extra_obs and self.policy_info_enable:
+            origin_extra_obs.update(dict(
+                qpos = info["qpos"],
+
+                rot_error = info["rot_error"],
+                loc_error = info["loc_error"],
+
+                loc_diff = info["loc_diff"],
+                rotvec_diff = info["rotvec_diff"],
+
+                base_forward = info["base_forward"],
+                base2goal_vec = info["base2goal_vec"],
+
+                last_action = info["last_action"],
+
+                head_camera_t = info["head_camera_t"],
+                gripper_camera_t = info["gripper_camera_t"]
+            ))
+
+        return origin_extra_obs
 
     # -------------------------------------------------------------------------------------------------
 
