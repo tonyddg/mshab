@@ -91,6 +91,8 @@ def gen_pick_task_plans(scene_builder):
         ):
             actor_id, actor_num = get_name_num(actor_id)
 
+            target_receptacles = base_articulation_id
+
             if args.task == "set_table" or (
                 args.task == "prepare_groceries" and "fridge" in base_articulation_id
             ):
@@ -139,6 +141,7 @@ def gen_pick_task_plans(scene_builder):
                         subtasks=[
                             PickSubtask(
                                 obj_id=f"{actor_id}-{actor_num}",
+                                target_receptacles = [target_receptacles],
                                 articulation_config=ArticulationConfig(
                                     articulation_type=articulation_id,
                                     articulation_id=f"{articulation_id}-{articulation_num}",
@@ -154,7 +157,10 @@ def gen_pick_task_plans(scene_builder):
             else:
                 task_plans.append(
                     TaskPlan(
-                        subtasks=[PickSubtask(obj_id=f"{actor_id}-{actor_num}")],
+                        subtasks=[PickSubtask(
+                            obj_id=f"{actor_id}-{actor_num}",
+                            target_receptacles = [target_receptacles],
+                        )],
                         build_config_name=build_config_name,
                         init_config_name=init_config_name,
                     )
@@ -210,6 +216,8 @@ def gen_place_task_plans(scene_builder):
         ):
             actor_id, actor_num = get_name_num(base_actor_id)
             goal_receptacle, goal_num = get_name_num(goal_receptacle_id)
+
+            target_receptacles = goal_receptacle_id
 
             receptacle_config_fp = osp.join(
                 ASSET_DIR,
@@ -352,6 +360,7 @@ def gen_place_task_plans(scene_builder):
                         subtasks=[
                             PlaceSubtask(
                                 obj_id=f"{actor_id}-{actor_num}",
+                                target_receptacles = [target_receptacles],
                                 goal_pos=goal_pos,
                                 goal_rectangle_corners=goal_rectangle_corners,
                                 articulation_config=ArticulationConfig(
@@ -372,6 +381,7 @@ def gen_place_task_plans(scene_builder):
                         subtasks=[
                             PlaceSubtask(
                                 obj_id=f"{actor_id}-{actor_num}",
+                                target_receptacles = [target_receptacles],
                                 goal_pos=goal_pos,
                                 goal_rectangle_corners=goal_rectangle_corners,
                             )

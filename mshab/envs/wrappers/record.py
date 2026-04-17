@@ -29,6 +29,25 @@ from mshab.utils.io import NoIndent, NoIndentSupportingJSONEncoder
 from mshab.utils.label_dataset import get_episode_label_and_events
 from mshab.utils.video import put_info_on_image
 
+def recursive_drop_metadata_for_label(data, drop_keys=frozenset({"target_receptacles"})):
+    '''
+    保留 target_receptacles 在写入 HDF5 的 info 里，但在做 label 之前把它从 ep_infos 里过滤掉。
+    '''
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            if k in drop_keys:
+                continue
+            child = recursive_drop_metadata_for_label(v, drop_keys=drop_keys)
+            if child is not None:
+                out[k] = child
+        return out
+
+    # 直接丢弃字符串类数组，避免后续 to_numpy(..., dtype=float) 爆掉
+    if isinstance(data, np.ndarray) and data.dtype.kind in {"S", "U", "O"}:
+        return None
+
+    return data
 
 def parse_env_info(env: gym.Env):
     # spec can be None if not initialized from gymnasium.make
@@ -529,6 +548,8 @@ class RecordEpisode(gym.Wrapper):
                 episode_info = dict()
 
                 if self.label_episode:
+                    label_infos = recursive_drop_metadata_for_label(self._trajectory_buffer.info)
+
                     episode_label, episode_events, episode_events_verbose = (
                         get_episode_label_and_events(
                             self.base_env.task_cfgs,
@@ -542,7 +563,8 @@ class RecordEpisode(gym.Wrapper):
                             ),
                             # NOTE (arth): we disclude reset infos for episode labeling
                             common.index_dict_array(
-                                self._trajectory_buffer.info,
+                                # self._trajectory_buffer.info,
+                                label_infos,
                                 (
                                     slice(start_ptr + 1, end_ptr),
                                     env_idx,

@@ -25,6 +25,7 @@ RectCorners = Union[
 ]
 HandleJointIdxAndRelativeHandlePosition = Tuple[int, PointTuple]
 
+TargetReceptacle = Optional[List[str]]
 
 @dataclass
 class ArticulationConfig:
@@ -36,9 +37,12 @@ class ArticulationConfig:
 
 @dataclass
 class Subtask:
+    target_receptacles: TargetReceptacle = field(default=None, kw_only=True)
+    
     type: str = field(init=False)
     uid: str = field(init=False)
     composite_subtask_uids: List[str] = field(init=False)
+    # 新增：单环境时长度通常为 1；merge 后长度可为 num_envs
 
     def __post_init__(self):
         assert self.type in ["pick", "place", "navigate", "open", "close"]
@@ -47,6 +51,29 @@ class Subtask:
         if getattr(self, "composite_subtask_uids", None) is None:
             self.composite_subtask_uids = [self.uid]
 
+def _normalize_target_receptacles(value) -> TargetReceptacle:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value]
+    raise TypeError(
+        f"target_receptacles should be None / str / list[str], but got {type(value)}"
+    )
+
+def _upgrade_subtask_dict_for_backward_compat(subtask: Dict) -> Dict:
+    subtask = dict(subtask)
+
+    # 兼容旧 task plan：旧文件里没有这个字段
+    if "target_receptacles" not in subtask:
+        subtask["target_receptacles"] = None
+    else:
+        subtask["target_receptacles"] = _normalize_target_receptacles(
+            subtask["target_receptacles"]
+        )
+
+    return subtask
 
 @dataclass
 class SubtaskConfig:
@@ -74,7 +101,8 @@ class SubtaskConfig:
 class PickSubtask(Subtask):
     obj_id: str
     articulation_config: Optional[ArticulationConfig] = None
-
+    source_obj_ids: Optional[List[str]] = field(default=None, kw_only=True)
+    
     def __post_init__(self):
         self.type = "pick"
         super().__post_init__()
@@ -257,6 +285,8 @@ def plan_data_from_file(config_path: str = None) -> PlanData:
         init_config_name = task_plan_data["init_config_name"]
         subtasks = []
         for subtask in task_plan_data["subtasks"]:
+            subtask = _upgrade_subtask_dict_for_backward_compat(subtask)
+
             subtask_type = subtask["type"]
             if subtask_type == "pick":
                 cls = PickSubtask
