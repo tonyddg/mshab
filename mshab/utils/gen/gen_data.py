@@ -28,11 +28,14 @@ from mshab.utils.label_dataset import get_episode_label_and_events
 from mshab.utils.logger import Logger, LoggerConfig
 from mshab.utils.time import NonOverlappingTimeProfiler
 
+# 使用包含容器信息的，新的 task plan
+USE_TASK_PLAN_NAME = "task_plans_new"
+
 # 最好是 63 的倍数，记录视频则尽可能小如 4
 NUM_ENVS = 252
 SEED = 2024
 # 收集 MAX_TRAJECTORIES 条轨迹，仅成功的轨迹会被保留, 可以取约 NUM_ENVS * 0.6
-MAX_TRAJECTORIES = 300
+MAX_TRAJECTORIES = 500
 
 SAVE_TRAJECTORIES = True
 SAVE_GRASP_POSE = False
@@ -108,7 +111,7 @@ def eval(
         cat_pixels=False,
         task_plan_fp=(
             ASSET_DIR
-            / f"scene_datasets/replica_cad_dataset/rearrange/task_plans/{task}/{subtask}/{split}/{obj_name}.json"
+            / f"scene_datasets/replica_cad_dataset/rearrange/{USE_TASK_PLAN_NAME}/{task}/{subtask}/{split}/{obj_name}.json"
         ),
         spawn_data_fp=(
             ASSET_DIR
@@ -125,6 +128,14 @@ def eval(
             robot_force_mult=0.001,
             robot_force_penalty_min=0.2,
             target_randomization=False,
+
+            pi0_info_enable = True,
+            pi0_info_merge_to_extra_obs = False,
+            pi0_is_infer_mode = False,
+
+            policy_info_enable = False,
+            policy_info_merge_to_extra_obs = False,
+            receptacles_enable = True,
         ),
     )
     logger_cfg = LoggerConfig(
