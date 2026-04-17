@@ -51,6 +51,9 @@ from mshab.utils.array import (
 
 from mani_skill.utils.geometry import rotation_conversions
 
+from mshab.utils.grasp.compute_grasp_pose import compute_grasp_pose_by_obb_torch
+from mshab.utils.grasp.ycb_utility import get_ycb_size, build_special_object_grasp_T, SPECIAL_OBJECT_GRASP_POSE_DICT, get_special_object_grasp_pose_cfg
+
 # 末端连杆名称
 FETCH_TCP_LINK_NAME = "gripper_link"
 # 移动底盘所在连杆名称
@@ -81,6 +84,9 @@ def quaternion_to_rpy_eular(quat: torch.Tensor):
 
 ##### 辅助函数 #####
 
+# TODO: 测试放置的情况
+# TODO: 生成抓取位姿时, 当 TCP 相对 YCB 中心过低时要向上偏置
+
 @register_env("SequentialTask-v0")
 class SequentialTaskEnv(SceneManipulationEnv):
     """
@@ -97,6 +103,309 @@ class SequentialTaskEnv(SceneManipulationEnv):
     Visualization: link to a video/gif of the task being solved
     """
 
+    # =========================
+    # Pick grasp pose settings
+    # =========================
+    PICK_GRASP_APPROACHING = (0.0, 0.0, -1.0)
+    PICK_GRASP_TARGET_CLOSING = None
+    PICK_GRASP_DEPTH = 0.0
+    PICK_GRASP_ORTHO = True
+
+    SPECIAL_GRASP_CACHE_DEVICE = "cpu"
+
+    def _ensure_pick_grasp_caches(self):
+        if not hasattr(self, "_special_grasp_cfg_cache"):
+            self._special_grasp_cfg_cache = dict()
+        if not hasattr(self, "_special_grasp_obj_raw_pose_cache"):
+            self._special_grasp_obj_raw_pose_cache = dict()
+        if not hasattr(self, "_ycb_size_cache"):
+            self._ycb_size_cache = dict()
+
+    def _split_obj_instance_name(self, obj_id: str) -> str:
+        # "024_bowl-0" -> "024_bowl"
+        # "003_cracker_box-1" -> "003_cracker_box"
+        return obj_id.rsplit("-", 1)[0]
+
+    def _infer_pick_obj_id_for_env(
+        self,
+        subtask: PickSubtask,
+        env_id: int,
+        target_obj: Actor,
+    ) -> str:
+        # 首选 merge 时保留下来的原始 obj_id
+        if getattr(subtask, "source_obj_ids", None) is not None:
+            return subtask.source_obj_ids[env_id]
+
+        # 兜底：尝试从底层 entity 名称恢复
+        if hasattr(target_obj, "_scene_idxs") and hasattr(target_obj, "_objs"):
+            local_idx = target_obj._scene_idxs.tolist().index(env_id)
+            entity_name = target_obj._objs[local_idx].name
+            prefix = f"env-{env_id}_"
+            if entity_name.startswith(prefix):
+                entity_name = entity_name[len(prefix):]
+            return entity_name
+
+        return subtask.obj_id
+
+    def _pose_matrices_to_vec7(self, T: torch.Tensor) -> torch.Tensor:
+        """
+        T: [B, 4, 4] -> [B, 7]
+        输出格式与 vectorize_pose 一致：p(3) + q(4)
+        """
+        if T.ndim == 2:
+            T = T.unsqueeze(0)
+        p = T[:, :3, 3]
+        q = rotation_conversions.matrix_to_quaternion(T[:, :3, :3])
+        return torch.cat([p, q], dim=-1)
+
+    def _is_special_grasp_object(self, ycb_id: str) -> bool:
+        self._ensure_pick_grasp_caches()
+        if ycb_id in self._special_grasp_cfg_cache:
+            return True
+        try:
+            cfg = get_special_object_grasp_pose_cfg(ycb_id)
+        except Exception:
+            return False
+        self._special_grasp_cfg_cache[ycb_id] = cfg
+        return True
+
+    def _get_special_grasp_cfg_cached(self, ycb_id: str) -> Dict[str, Any]:
+        self._ensure_pick_grasp_caches()
+        if ycb_id not in self._special_grasp_cfg_cache:
+            self._special_grasp_cfg_cache[ycb_id] = get_special_object_grasp_pose_cfg(ycb_id)
+        return self._special_grasp_cfg_cache[ycb_id]
+
+    def _get_ycb_size_tensor_cached(
+        self,
+        ycb_id: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        self._ensure_pick_grasp_caches()
+        if ycb_id not in self._ycb_size_cache:
+            self._ycb_size_cache[ycb_id] = torch.as_tensor(
+                get_ycb_size(ycb_id),
+                dtype=torch.float32,
+                device="cpu",
+            )
+        return self._ycb_size_cache[ycb_id].to(device=device, dtype=dtype)
+
+    def _get_special_obj_raw_pose_wrt_tcp_cache(self, ycb_id: str) -> torch.Tensor:
+        """
+        返回缓存的 success_obj_raw_pose_wrt_tcp，shape [N, 7]，保存在 CPU。
+        """
+        self._ensure_pick_grasp_caches()
+        if ycb_id not in self._special_grasp_obj_raw_pose_cache:
+            cfg = self._get_special_grasp_cfg_cached(ycb_id)
+            data = torch.load(
+                cfg["path"],
+                map_location=self.SPECIAL_GRASP_CACHE_DEVICE,
+            )["success_obj_raw_pose_wrt_tcp"]
+            self._special_grasp_obj_raw_pose_cache[ycb_id] = torch.as_tensor(
+                data,
+                dtype=torch.float32,
+                device=self.SPECIAL_GRASP_CACHE_DEVICE,
+            ).reshape(-1, 7)
+        return self._special_grasp_obj_raw_pose_cache[ycb_id]
+
+    def _sample_special_object_grasp_pose_cached(
+        self,
+        ycb_id: str,
+        num_sample: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        返回 sampled_obj_raw_pose_wrt_tcp, shape [num_sample, 7]
+        """
+        cached = self._get_special_obj_raw_pose_wrt_tcp_cache(ycb_id)  # CPU [N,7]
+        sample_idx = torch.randint(
+            low=0,
+            high=cached.shape[0],
+            size=(num_sample,),
+            dtype=torch.long,
+            device="cpu",
+        )
+        sampled = cached[sample_idx]
+        return sampled.to(device=device, dtype=dtype)
+
+    def _build_special_object_grasp_T_cached(
+        self,
+        ycb_id: str,
+        obj_origin_T: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        obj_origin_T: [B,4,4]
+        返回: [B,4,4]
+        逻辑与 build_special_object_grasp_T 一致，但把抓取姿态库做了缓存。
+        """
+        cfg = self._get_special_grasp_cfg_cached(ycb_id)
+
+        obj_origin_T = torch.as_tensor(
+            obj_origin_T,
+            dtype=torch.float32,
+            device=obj_origin_T.device,
+        ).reshape(-1, 4, 4)
+
+        device = obj_origin_T.device
+        dtype = obj_origin_T.dtype
+        B = obj_origin_T.shape[0]
+
+        sampled_obj_raw_pose_wrt_tcp = self._sample_special_object_grasp_pose_cached(
+            ycb_id=ycb_id,
+            num_sample=B,
+            device=device,
+            dtype=dtype,
+        )
+
+        sampled_T_tcp_obj = torch.as_tensor(
+            Pose.create_from_pq(
+                p=sampled_obj_raw_pose_wrt_tcp[:, :3],
+                q=sampled_obj_raw_pose_wrt_tcp[:, 3:],
+            ).to_transformation_matrix(),
+            dtype=dtype,
+            device=device,
+        )
+
+        # T_ref_tcp = T_ref_obj @ inv(T_tcp_obj)
+        special_grasp_T = obj_origin_T @ torch.linalg.inv(sampled_T_tcp_obj)
+
+        if cfg["z_axis_rot_symmetry"]:
+            rot_z_pi = torch.eye(4, dtype=dtype, device=device).unsqueeze(0).repeat(B, 1, 1)
+            rot_z_pi[:, 0, 0] = -1.0
+            rot_z_pi[:, 1, 1] = -1.0
+
+            sampled_T_tcp_obj_flip = sampled_T_tcp_obj @ rot_z_pi
+            special_grasp_T_flip = obj_origin_T @ torch.linalg.inv(sampled_T_tcp_obj_flip)
+
+            # 选 x 轴更接近世界 +x 的候选
+            score = special_grasp_T[:, 0, 0]
+            score_flip = special_grasp_T_flip[:, 0, 0]
+            use_flip_mask = score_flip > score
+            if use_flip_mask.any():
+                special_grasp_T[use_flip_mask] = special_grasp_T_flip[use_flip_mask]
+
+        return special_grasp_T
+
+    def _get_pick_grasp_pose_world_for_subtask(
+        self,
+        subtask_num: int,
+        env_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        返回当前 pick subtask 在 env_idx 上的目标抓取位姿（世界坐标系）
+        输出 shape: [len(env_idx), 7]
+        """
+        subtask = self.task_plan[subtask_num]
+        assert isinstance(subtask, PickSubtask)
+
+        target_obj = self.subtask_objs[subtask_num]
+        if target_obj is None:
+            raise RuntimeError(f"PickSubtask at index {subtask_num} has no target object")
+
+        # Sequential merge 后，pick 目标对象应覆盖全部环境
+        if len(target_obj._scene_idxs) != self.num_envs:
+            raise NotImplementedError(
+                "Pick grasp pose generation currently expects merged pick actor "
+                "to cover all environments."
+            )
+
+        obj_pose_T_all = target_obj.pose.to_transformation_matrix()  # [num_envs, 4, 4]
+        out_pose_vec7 = torch.zeros(
+            (env_idx.numel(), 7),
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        # 先按 ycb_id 分组，便于 batch 计算
+        ycb_id_to_local_positions = defaultdict(list)
+        for local_i, env_id in enumerate(env_idx.tolist()):
+            obj_id = self._infer_pick_obj_id_for_env(subtask, env_id, target_obj)
+            ycb_id = self._split_obj_instance_name(obj_id)
+            ycb_id_to_local_positions[ycb_id].append(local_i)
+
+        for ycb_id, local_positions in ycb_id_to_local_positions.items():
+            local_pos_tensor = torch.as_tensor(
+                local_positions, device=env_idx.device, dtype=torch.long
+            )
+            batch_env_ids = env_idx[local_pos_tensor]
+            batch_obj_pose_T = obj_pose_T_all[batch_env_ids]
+
+            if self._is_special_grasp_object(ycb_id):
+                grasp_T = self._build_special_object_grasp_T_cached(
+                    ycb_id=ycb_id,
+                    obj_origin_T=batch_obj_pose_T,
+                )
+            else:
+                size = self._get_ycb_size_tensor_cached(
+                    ycb_id=ycb_id,
+                    device=batch_obj_pose_T.device,
+                    dtype=batch_obj_pose_T.dtype,
+                ).view(1, 3).repeat(batch_obj_pose_T.shape[0], 1)
+
+                grasp_T = compute_grasp_pose_by_obb_torch(
+                    pose=batch_obj_pose_T,
+                    size=size,
+                    approaching=self.PICK_GRASP_APPROACHING,
+                    target_closing=self.PICK_GRASP_TARGET_CLOSING,
+                    depth=self.PICK_GRASP_DEPTH,
+                    ortho=self.PICK_GRASP_ORTHO,
+                )
+
+            out_pose_vec7[local_pos_tensor] = self._pose_matrices_to_vec7(grasp_T)
+
+        return out_pose_vec7
+    
+    def get_pick_place_target_pose_world(self):
+        """
+        返回：
+        - target_pose_world: [num_envs, 7]
+            - pick: 目标抓取位姿（世界坐标系）
+            - place: 放置目标中心 pose（世界坐标系）
+        - is_pick: [num_envs] bool
+
+        若当前任一环境的子任务不是 PickSubtask / PlaceSubtask，则抛 NotImplementedError。
+        """
+        target_pose_world = torch.zeros(
+            (self.num_envs, 7), device=self.device, dtype=torch.float32
+        )
+        is_pick = torch.zeros(
+            (self.num_envs,), device=self.device, dtype=torch.bool
+        )
+
+        currently_running_subtasks = torch.unique(
+            torch.clip(self.subtask_pointer, max=len(self.task_plan) - 1)
+        )
+
+        for subtask_num in currently_running_subtasks.tolist():
+            env_idx = torch.where(self.subtask_pointer == subtask_num)[0]
+            subtask = self.task_plan[subtask_num]
+
+            if isinstance(subtask, PickSubtask):
+                target_pose_world[env_idx] = self._get_pick_grasp_pose_world_for_subtask(
+                    subtask_num=subtask_num,
+                    env_idx=env_idx,
+                )
+                is_pick[env_idx] = True
+
+            elif isinstance(subtask, PlaceSubtask):
+                target_goal = self.subtask_goals[subtask_num]
+                if target_goal is None:
+                    raise RuntimeError(
+                        f"PlaceSubtask at index {subtask_num} has no goal actor"
+                    )
+
+                target_pose_world[env_idx] = vectorize_pose(target_goal.pose)[env_idx]
+                is_pick[env_idx] = False
+
+            else:
+                raise NotImplementedError(
+                    f"Only PickSubtask and PlaceSubtask are supported, "
+                    f"but got {subtask.type} ({type(subtask)}) at subtask {subtask_num}"
+                )
+
+        return target_pose_world, is_pick
+    
     ### Pi0
 
     def _pi0_initalize_episode(self, env_idx: torch.Tensor, options):
@@ -198,7 +507,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         # 传入位姿均相对世界坐标系
         new_pose: Optional[Union[Pose, Literal[
             "tcp", # 当前 TCP 位姿
-            "goal", # 子任务目标位姿
+            "target", # 子任务目标位姿
             "reset" # 任务结束位姿
         ]]] = None,
         env_idx: int = 0
@@ -206,13 +515,16 @@ class SequentialTaskEnv(SceneManipulationEnv):
         if not isinstance(new_pose, Pose):
             if new_pose == "tcp" or new_pose == None:
                 use_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
+            elif new_pose == "target":
+                target_pose_world, is_pick = self.get_pick_place_target_pose_world()
+                use_pose = Pose(target_pose_world)
             else:
-                raise NotImplemented("尚未实现引用其他位姿")
+                raise NotImplementedError("尚未实现引用其他位姿")
         else:
             use_pose = new_pose
 
         origin_pose = self.goal_point.pose
-        origin_pose.raw_pose[env_idx] = use_pose.raw_pose[0]
+        origin_pose.raw_pose[env_idx] = use_pose.raw_pose[env_idx]
         self.goal_point.set_pose(origin_pose)
 
     def get_policy_goal_pose(
@@ -367,6 +679,41 @@ class SequentialTaskEnv(SceneManipulationEnv):
             self.last_action = action
         return reward
     
+    ### 载入容器信息
+    TARGET_RECEPTACLE_MAX_BYTES = 64
+
+    def _get_current_target_receptacles_info(self):
+        current_target_receptacles = ["" for _ in range(self.num_envs)]
+
+        currently_running_subtasks = torch.unique(
+            torch.clip(self.subtask_pointer, max=len(self.task_plan) - 1)
+        )
+
+        for subtask_num in currently_running_subtasks.tolist():
+            env_idx = torch.where(self.subtask_pointer == subtask_num)[0]
+            subtask = self.task_plan[subtask_num]
+
+            merged_target_receptacles = getattr(subtask, "target_receptacles", None)
+            if merged_target_receptacles is None:
+                continue
+
+            assert len(merged_target_receptacles) == self.num_envs
+
+            for env_id in env_idx.tolist():
+                receptacle = merged_target_receptacles[env_id]
+                current_target_receptacles[env_id] = receptacle or ""
+
+        encoded = [s.encode("utf-8") for s in current_target_receptacles]
+
+        # 防止固定长度字符串被静默截断
+        max_len = max(len(x) for x in encoded) if encoded else 0
+        assert max_len <= self.TARGET_RECEPTACLE_MAX_BYTES, (
+            f"target_receptacle length {max_len} exceeds "
+            f"TARGET_RECEPTACLE_MAX_BYTES={self.TARGET_RECEPTACLE_MAX_BYTES}"
+        )
+
+        return np.asarray(encoded, dtype=f"S{self.TARGET_RECEPTACLE_MAX_BYTES}")
+
     ###
 
     SUPPORTED_ROBOTS = ["fetch", "fetch_modified"]
@@ -433,11 +780,14 @@ class SequentialTaskEnv(SceneManipulationEnv):
         pi0_is_infer_mode: bool = False,
 
         # 启用 RL Policy 所需的 info
-        policy_info_enable: bool = False,
+        policy_info_enable: bool = True,
         # 将 RL policy 信息合并到 extra obs 中
-        policy_info_merge_to_extra_obs: bool = False,
+        policy_info_merge_to_extra_obs: bool = True,
         # 显示末端与目标的坐标系
         policy_show_goal_axis: bool = True,
+
+        # 记录容器信息
+        receptacles_enable: bool = True,
 
         # TODO: 自定义结束位姿
         custom_reset_ee_pose: Optional[Pose] = None,
@@ -458,6 +808,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
         if (not self.policy_info_enable) and self.policy_info_merge_to_extra_obs:
             warn("将 policy 信息合并到 extra obs 前需要启用 policy_info_enable")
             self.policy_info_merge_to_extra_obs = False
+
+        self.receptacles_enable = receptacles_enable
         
         self.task_cfgs: Dict[str, SubtaskConfig] = dict(
             pick=self.pick_cfg,
@@ -508,6 +860,32 @@ class SequentialTaskEnv(SceneManipulationEnv):
     # -------------------------------------------------------------------------------------------------
     # PROCESS TASKS
     # -------------------------------------------------------------------------------------------------
+    
+    def _merge_target_receptacles(
+        self,
+        parallel_subtasks: List[Subtask],
+    ) -> Optional[List[str]]:
+        """
+        单环境子任务里 target_receptacles 通常长度为 1；
+        merge 后返回长度为 num_envs 的 list[str]。
+        旧 task plan 或未提供该字段时返回 None。
+        """
+        merged = []
+        has_any = False
+
+        for subtask in parallel_subtasks:
+            tr = getattr(subtask, "target_receptacles", None)
+            if tr is None or len(tr) == 0:
+                merged.append("")
+            else:
+                assert len(tr) == 1, (
+                    "Expected single-env subtask.target_receptacles to have length 1, "
+                    f"but got {tr}"
+                )
+                merged.append(tr[0])
+                has_any = True
+
+        return merged if has_any else None
 
     def _merge_pick_subtasks(
         self, subtask_num: int, parallel_subtasks: List[PickSubtask]
@@ -515,7 +893,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         merged_obj_name = f"obj_{subtask_num}"
         self.subtask_objs.append(
             self._create_merged_actor_from_subtasks(
-                parallel_subtasks, name=merged_obj_name
+                parallel_subtasks, name=merged_obj_name,
             )
         )
         self.subtask_goals.append(None)
@@ -554,6 +932,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
                 #       in this case, ArticulationConfig attributes like handle_link_idx
                 #       don't make much sense (and aren't needed by the pick task anyways)
                 articulation_config=None,
+                source_obj_ids=[subtask.obj_id for subtask in parallel_subtasks],
+                target_receptacles=self._merge_target_receptacles(parallel_subtasks),
             )
         )
 
@@ -608,6 +988,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
                 goal_rectangle_corners=merged_goal_rectangle_corners,
                 validate_goal_rectangle_corners=False,
                 articulation_config=None,
+                target_receptacles=self._merge_target_receptacles(parallel_subtasks),
             )
         )
         self.check_progressive_success_subtask_nums.append(subtask_num)
@@ -1215,6 +1596,14 @@ class SequentialTaskEnv(SceneManipulationEnv):
         if self.policy_info_enable:
             policy_info = self._policy_evaluate()
             origin_info.update(policy_info)
+
+        if self.receptacles_enable:
+            target_receptacles = self._get_current_target_receptacles_info()
+            origin_info.update(target_receptacles = target_receptacles)
+
+        # # Debug
+        # target_pose_world, is_pick = self.get_pick_place_target_pose_world()
+        # print(f"target_pose_world {target_pose_world}, is_pick {is_pick}")
 
         return origin_info
 
