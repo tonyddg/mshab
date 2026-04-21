@@ -62,6 +62,8 @@ FETCH_BASE_LINK_NAME = "base_link"
 FETCH_GRIPPER_OPEN_QPOS = 0.050
 # 夹爪关节在 Sapien 标准 QPOS 中的索引
 FETCH_GRIPPER_QPOS_IDX = [13, 14]
+# 关节夹爪在 Fetch agent 中的索引
+FETCH_GRIPPER_ACT_IDX = 7
 # 与原版的 Fetch 存在不同, 可能需要同步到原版的 Fetch
 FETCH_HEAD_CAMERA_LINK = "head_camera_link"
 FETCH_GRIPPER_CAMERA_LINK = "gripper_link"
@@ -444,7 +446,51 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
         return target_pose_world, is_pick
     
+    ### 通用
+
+    def step(self, action):
+        # 缓存用户真正传进来的动作
+        if isinstance(action, torch.Tensor):   # torch.Tensor
+            self._cur_action[:] = action.clone()
+        else:
+            self._cur_action[:] = torch.tensor(action, device = self.device)
+
+        step_result = super().step(action)
+
+        if self.policy_info_enable:
+            if self.tcp_point is not None:
+                self.tcp_point.set_pose(self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose)
+        # 更新上一时刻动作
+        self._last_action = self._cur_action
+
+        return step_result
+
+    def _common_initalize_episode(self, env_idx: torch.Tensor, options):
+        with torch.device(self.device):
+            with torch.no_grad():
+                # 新重置的环境上一步动作为 0
+                if getattr(self, "_last_action", None) is None:
+                    self._last_action = torch.zeros((self.num_envs, self.agent.single_action_space.shape[0])) # type: ignore
+                else:
+                    # 假定 step 均为 Tensor
+                    self._last_action[env_idx] = 0
+                # 新重置的环境当前步动作为 0
+                if getattr(self, "_cur_action", None) is None:
+                    self._cur_action = torch.zeros((self.num_envs, self.agent.single_action_space.shape[0])) # type: ignore
+                else:
+                    # 假定 step 均为 Tensor
+                    self._cur_action[env_idx] = 0
+
     ### Pi0
+
+    def _pi0_pose_to_state(self, pose: Pose, grasp_qpos: torch.Tensor):
+        rot = pose.get_q()
+        if self.pi0_is_angleaxis_state:
+            rot, _ = quat_wxyz_tensor_to_axis_angle(rot)
+
+        return torch.concat(
+            [pose.get_p(), rot, grasp_qpos.unsqueeze(dim = 1)], dim = 1
+        )
 
     def _pi0_initalize_episode(self, env_idx: torch.Tensor, options):
         # GPU sim 下显式同步
@@ -472,7 +518,6 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
     def _pi0_evaluate(self):
         ### 转化为 Pi0 标准动作
-        ## TODO: 第一帧数据无效需要排除
 
         ## 本体观测：移动底盘坐标系下的末端位置、四元数姿态、当前夹爪张开程度（tl: 上一时刻, tc：当前时刻）
         w_b_tl_pose = Pose(self.last_base_pose_raw)
@@ -483,25 +528,31 @@ class SequentialTaskEnv(SceneManipulationEnv):
         # 整理为 Pi0 本体观测 (LeRobot 使用的是动作执行前的观测, Evaluate 直接获取的为动作执行后的状态, 因此此处使用 tl)
         # print(f"self.gripper_state_tl: {self.gripper_state_tl.shape}")
         # print(f"b_tl_eef_tl_pose.get_p(): {b_tl_eef_tl_pose.get_p().shape}") 
-        pi0_eef_state_tl = torch.concat(
-            [b_tl_eef_tl_pose.get_p(), b_tl_eef_tl_pose.get_q(), self.gripper_state_tl.unsqueeze(dim = 1)], dim = 1
-        )
 
         # 获取当前底盘与夹爪末端位姿
         w_b_tc_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
         w_eef_tc_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose   
 
-        # 获取当前夹爪状态
-        gripper_state_tc = self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX[0]] / FETCH_GRIPPER_OPEN_QPOS
+        # 获取当前夹爪状态 (使用两个夹爪位移的均值, 不进行标准化)
+        gripper_state_tc = torch.mean(self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX], dim = 1)
 
         # 非推理模式下将收集动作, 使用 s_{t-1} 状态
         if not self.pi0_is_infer_mode:
+            #TODO: 夹爪使用实际的夹爪动作
+            # pi0_eef_state_tl = torch.concat(
+            #     [b_tl_eef_tl_pose.get_p(), b_tl_eef_tl_pose.get_q(), self.gripper_state_tl.unsqueeze(dim = 1)], dim = 1
+            # )
+            pi0_eef_state_tl = self._pi0_pose_to_state(
+                b_tl_eef_tl_pose, self.gripper_state_tl
+            )
+
             # 动作：移动底盘坐标系下的末端位移变换（位置 + 固定欧拉角）+ 下一时刻夹爪张开程度
             # 获取基于运动坐标系的 Delta 动作
             eef_tl_trans = w_eef_tl_pose.inv() * w_eef_tc_pose
             # 整理为 Pi0 动作
+            print(f"self._cur_action: {self._cur_action}")
             pi0_eef_ref_action = torch.concat(
-                [eef_tl_trans.get_p(), quaternion_to_rpy_eular(eef_tl_trans.get_q()), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+                [eef_tl_trans.get_p(), quaternion_to_rpy_eular(eef_tl_trans.get_q()), self._cur_action[:, FETCH_GRIPPER_ACT_IDX].unsqueeze(dim = 1)], dim = 1
             )
 
             # 获取基于基座坐标系的 Delta 动作
@@ -509,7 +560,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
             b_tl_trans = b_tl_eef_tc_pose * b_tl_eef_tl_pose.inv()
             # 整理为 Pi0 动作
             pi0_eef_abs_action = torch.concat(
-                [b_tl_trans.get_p(), quaternion_to_rpy_eular(b_tl_trans.get_q()), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+                [b_tl_trans.get_p(), quaternion_to_rpy_eular(b_tl_trans.get_q()), self._cur_action[:,FETCH_GRIPPER_ACT_IDX].unsqueeze(dim = 1)], dim = 1
             )
 
             res_info = dict(
@@ -522,8 +573,11 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
             # 整理为当前时刻的 pi0 本体观测
             b_tc_eef_tc_pose = w_b_tc_pose.inv() * w_eef_tc_pose
-            pi0_eef_state_tc = torch.concat(
-                [b_tc_eef_tc_pose.get_p(), b_tc_eef_tc_pose.get_q(), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+            # pi0_eef_state_tc = torch.concat(
+            #     [b_tc_eef_tc_pose.get_p(), b_tc_eef_tc_pose.get_q(), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
+            # )
+            pi0_eef_state_tc = self._pi0_pose_to_state(
+                b_tc_eef_tc_pose, gripper_state_tc
             )
 
             res_info = dict(
@@ -548,7 +602,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
             "target", # 子任务目标位姿
             "reset" # 任务结束位姿
         ]]] = None,
-        env_idx: int = 0
+        env_idx: Optional[int] = None
     ):
         if not isinstance(new_pose, Pose):
             if new_pose == "tcp" or new_pose == None:
@@ -561,9 +615,13 @@ class SequentialTaskEnv(SceneManipulationEnv):
         else:
             use_pose = new_pose
 
-        origin_pose = self.goal_point.pose
-        origin_pose.raw_pose[env_idx] = use_pose.raw_pose[env_idx]
-        self.goal_point.set_pose(origin_pose)
+        goal_pose = self.goal_point.pose
+        if env_idx is not None:
+            goal_pose.raw_pose[env_idx] = use_pose.raw_pose[env_idx]
+        else:
+            goal_pose = use_pose
+        
+        self.goal_point.set_pose(goal_pose)
 
     def get_policy_goal_pose(
         self
@@ -639,50 +697,45 @@ class SequentialTaskEnv(SceneManipulationEnv):
         else:
             self.tcp_point = None
 
-    def _policy_initalize_episode(self, env_idx: torch.Tensor, options):
-        with torch.device(self.device):
-            with torch.no_grad():
-                # 新重置的环境上一步动作为 0
-                if not hasattr(self, "last_action"):
-                    self.last_action = torch.zeros((self.num_envs, self.agent.robot.max_dof))
-                else:
-                    # 假定 step 均为 Tensor
-                    self.last_action[env_idx] = 0
-
     def _policy_evaluate(self):
         
         ### 角度检查
-        tcp_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
-        # 计算位姿差必须是 TA-1 TB, 且 A B 有同一个观察坐标系 !!!
-        pose_diff = tcp_pose.inv() * self.goal_point.pose # type: ignore
+        eef_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
+        pose_diff = eef_pose.inv() * self.goal_point.pose # type: ignore
         assert isinstance(pose_diff, Pose)
 
-        # 使用世界坐标系下的差向量而不是末端或目标
-        loc_diff = tcp_pose.get_p() - self.goal_point.pose.get_p()
+        # 使用底盘坐标系下的差向量而不是末端或目标
+        base_pose_inv = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose.inv()
+        base_eef_pose = base_pose_inv * eef_pose
+        base_goal_pose = base_pose_inv * self.goal_point.pose
+        
+        loc_diff = base_eef_pose.get_p() - base_goal_pose.get_p()
         loc_error = torch.norm(loc_diff, dim = 1)
-
-        # rotvec_diff = rotation_conversions.quaternion_to_axis_angle(pose_diff.get_q())
-        # rot_error = torch.norm(rotvec_diff, dim = 1)
+        # print(f"loc_diff: {loc_diff}")
         rotvec_diff, rot_error = quat_wxyz_tensor_to_axis_angle(pose_diff.get_q())
 
         print(f"rotvec_diff: {rotvec_diff}")
         print(f"loc_diff: {loc_diff}")
 
         ### 底盘信息
+        # 底盘信息 (统一为底盘坐标系, 不考虑 z 方向, 即 XOY 平面投影)
         base_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
-        base_T = base_pose.to_transformation_matrix()
-        
+        base_pose_inv = base_pose.inv()
+
         if getattr(self, "robot_forward_in_base_link_tensor", None) is None:
             self.robot_forward_in_base_link_tensor = torch.as_tensor(
                 FETCH_FORWARD_IN_BASE_LINK, dtype=torch.float32, device=self.device
             )
         # 认为底盘紧贴底面, z 分量为 (0, 0, 1)
-        base_forward = base_T[:, :2, :2] @ self.robot_forward_in_base_link_tensor
+        goal_loc = (base_pose_inv * self.goal_point.pose).get_p()[:, 0:2]
+        # (保留以兼容旧的奖励函数) 认为底盘紧贴底面, 底盘前进方向即底盘坐标系 (1, 0, 0) 方向, z 分量为 (0, 0, 1)
+        base_forward = torch.zeros_like(goal_loc) # base_T[:, :2, :2] @ self.robot_forward_in_base_link_tensor
+        base_forward[:, 0] = 1
+        # (保留以兼容旧的奖励函数) 使用底盘坐标系时 base_loc 总为 (0, 0)
+        base_loc = torch.zeros_like(goal_loc)# base_T[:, 0:2, 3]
 
-        base_loc = base_T[:, 0:2, 3]
-        goal_loc = self.goal_point.pose.get_p()[:, 0:2]
         base2goal_vec = torch.as_tensor(goal_loc - base_loc)
-
+        
         ### 相机位姿
         base_world_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose.inv()
         # 头部相机坐标系在基座下的座标系
@@ -704,22 +757,12 @@ class SequentialTaskEnv(SceneManipulationEnv):
             base_forward = base_forward,
             base2goal_vec = base2goal_vec,
 
-            last_action = self.last_action,
+            last_action = self._last_action,
 
             head_camera_t = (base_world_pose * world_head_camera_pose).to_transformation_matrix(),
             gripper_camera_t = (base_world_pose * world_gripper_camera_pose).to_transformation_matrix(),
         )
         return addition_info
-
-    def get_reward(self, obs: Any, action: torch.Tensor, info: Dict):
-        reward = super().get_reward(obs, action, info)
-        # 更新 TCP 指示器
-        if self.policy_info_enable:
-            if self.tcp_point is not None:
-                self.tcp_point.set_pose(self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose)
-            # 更新上一时刻动作
-            self.last_action = action
-        return reward
     
     ### 载入容器信息
     TARGET_RECEPTACLE_MAX_BYTES = 64
@@ -820,6 +863,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
         pi0_info_merge_to_extra_obs: bool = False,
         # 推理模式下, 不分析动作, 且输出状态为动作执行后的状态
         pi0_is_infer_mode: bool = False,
+        # pi0 是否使用轴角对位姿观测 (与 Libero 保持一致)
+        pi0_is_angleaxis_state: bool = True,
 
         # 启用 RL Policy 所需的 info
         policy_info_enable: bool = True,
@@ -840,6 +885,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         self.pi0_info_enable = pi0_info_enable
         self.pi0_is_infer_mode = pi0_is_infer_mode
         self.pi0_info_merge_to_extra_obs = pi0_info_merge_to_extra_obs
+        self.pi0_is_angleaxis_state = pi0_is_angleaxis_state
         if (not self.pi0_info_enable) and self.pi0_info_merge_to_extra_obs:
             warn("将 pi0 信息合并到 extra obs 前需要启用 pi0_info_enable")
             self.pi0_info_merge_to_extra_obs = False
@@ -1500,12 +1546,11 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
             self.resting_qpos = torch.tensor(self.agent.keyframes["rest"].qpos[3:-2])
 
+            # 用于清空上一时刻动作
+            self._common_initalize_episode(env_idx, options)
             ### 用于转化 Pi0 标准动作
             if self.pi0_info_enable:
                 self._pi0_initalize_episode(env_idx, options)
-            ### 用于 RL 策略
-            if self.policy_info_enable:
-                self._policy_initalize_episode(env_idx, options)
 
     # -------------------------------------------------------------------------------------------------
 
@@ -2399,5 +2444,6 @@ class SequentialTaskEnv(SceneManipulationEnv):
     def render(self):
         self.set_moving_goal_poses_for_render()
         return super().render()
+        
 
     # -------------------------------------------------------------------------------------------------
