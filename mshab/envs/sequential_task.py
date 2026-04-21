@@ -82,6 +82,44 @@ def quaternion_to_rpy_eular(quat: torch.Tensor):
     rot_rpy = torch.flip(rot_rpy, dims = [1, ])
     return rot_rpy
 
+# 使用与 reach 环境相同的四元数轴角对转化函数
+# 该函数与 maniskill 提供的 rotation_conversions.quaternion_to_axis_angle 存在区别
+def quat_wxyz_tensor_to_axis_angle(q: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    q: (..., 4) 四元数张量，顺序为 (w, x, y, z)
+    返回: (..., 3) 轴角向量表示与旋转角 (rotation vector): 方向=旋转轴，模长=旋转角(弧度)
+    """
+    if q.shape[-1] != 4:
+        raise ValueError(f"Expected shape (..., 4), got {q.shape}")
+
+    # 归一化
+    q = q / (q.norm(dim=-1, keepdim=True).clamp_min(eps))
+
+    w = q[..., 0]
+    v = q[..., 1:]  # (x, y, z)
+    v_norm = v.norm(dim=-1)  # ||v||
+
+    # 为了得到更“短”的角度（0..pi），可将 w<0 的四元数整体取负（等价旋转）
+    sign = torch.where(w < 0, -torch.ones_like(w), torch.ones_like(w))
+    w = w * sign
+    v = v * sign.unsqueeze(-1)
+    v_norm = v_norm  # v_norm 不变
+
+    # angle = 2 * atan2(||v||, w)
+    angle = 2.0 * torch.atan2(v_norm, w.clamp_min(eps))  # (...,)
+    # axis = v / ||v||，并输出 rotvec = axis * angle
+    axis = v / v_norm.clamp_min(eps).unsqueeze(-1)
+    rotvec = axis * angle.unsqueeze(-1)  # (..., 3)
+
+    # 小角度时数值更稳定：q ≈ [1, r/2] => rotvec ≈ 2*v（小角度可能突变为 2pi）
+    small = v_norm < 1e-3
+    rotvec = torch.where(small.unsqueeze(-1), 2.0 * v, rotvec)
+    # angle = torch.where(small.unsqueeze(-1), 2.0 * v_norm, angle).squeeze(-1)
+    # rotvec[small] = 2.0 * v
+    # angle[small] = 2.0 * v_norm
+
+    return rotvec, angle
+
 ##### 辅助函数 #####
 
 # TODO: 测试放置的情况
@@ -621,18 +659,22 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
         # 使用世界坐标系下的差向量而不是末端或目标
         loc_diff = tcp_pose.get_p() - self.goal_point.pose.get_p()
-        rotvec_diff = rotation_conversions.quaternion_to_axis_angle(pose_diff.get_q())
-        rot_error = torch.norm(rotvec_diff, dim = 1)
         loc_error = torch.norm(loc_diff, dim = 1)
+
+        # rotvec_diff = rotation_conversions.quaternion_to_axis_angle(pose_diff.get_q())
+        # rot_error = torch.norm(rotvec_diff, dim = 1)
+        rotvec_diff, rot_error = quat_wxyz_tensor_to_axis_angle(pose_diff.get_q())
+
+        print(f"rotvec_diff: {rotvec_diff}")
+        print(f"loc_diff: {loc_diff}")
 
         ### 底盘信息
         base_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
         base_T = base_pose.to_transformation_matrix()
         
-        if not hasattr(self, "robot_forward_in_base_link_tensor"):
+        if getattr(self, "robot_forward_in_base_link_tensor", None) is None:
             self.robot_forward_in_base_link_tensor = torch.as_tensor(
-                FETCH_FORWARD_IN_BASE_LINK, dtype = torch.float32,
-                device = self.device
+                FETCH_FORWARD_IN_BASE_LINK, dtype=torch.float32, device=self.device
             )
         # 认为底盘紧贴底面, z 分量为 (0, 0, 1)
         base_forward = base_T[:, :2, :2] @ self.robot_forward_in_base_link_tensor
@@ -662,7 +704,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
             base_forward = base_forward,
             base2goal_vec = base2goal_vec,
 
-            last_action = self.last_action if self.last_action is not None else torch.zeros((self.num_envs, self.agent.robot.max_dof)),
+            last_action = self.last_action,
 
             head_camera_t = (base_world_pose * world_head_camera_pose).to_transformation_matrix(),
             gripper_camera_t = (base_world_pose * world_gripper_camera_pose).to_transformation_matrix(),
