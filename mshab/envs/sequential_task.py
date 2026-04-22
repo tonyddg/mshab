@@ -122,6 +122,28 @@ def quat_wxyz_tensor_to_axis_angle(q: torch.Tensor, eps: float = 1e-8) -> Tuple[
 
     return rotvec, angle
 
+# PI0_ACT_ROT_TYPE = Literal["axis_angle", "rot_6d", "rpy_euler"]
+# PI0_OBS_ROT_TYPE = Literal["axis_angle", "rot_6d", "quat"]
+ROT_TYPE = Literal["axis_angle", "rot_6d", "quat", "rpy_euler"]
+
+def pose_to_target_type(pose: Pose, rot_type: ROT_TYPE, addition_state: List = []):
+    rot = pose.get_q()
+    if rot_type == "axis_angle":
+        rot, _ = quat_wxyz_tensor_to_axis_angle(rot)
+    elif rot_type == "rot_6d":
+        rot = rotation_conversions.quaternion_to_matrix(rot)
+        rot = rotation_conversions.matrix_to_rotation_6d(rot)
+    elif rot_type == "rpy_euler":
+        rot = quaternion_to_rpy_eular(rot)
+    elif rot_type == "quat":
+        pass
+    else:
+        raise NotImplemented(f"Unknown rot_type: {rot_type}")
+
+    return torch.concat(
+        [pose.get_p(), rot] + addition_state, dim = 1
+    )
+
 ##### 辅助函数 #####
 
 # TODO: 测试放置的情况
@@ -483,14 +505,37 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
     ### Pi0
 
-    def _pi0_pose_to_state(self, pose: Pose, grasp_qpos: torch.Tensor):
-        rot = pose.get_q()
-        if self.pi0_is_angleaxis_state:
-            rot, _ = quat_wxyz_tensor_to_axis_angle(rot)
+    # def _pi0_pose_to_state(self, pose: Pose, grasp_qpos: torch.Tensor):
+    #     rot = pose.get_q()
+    #     if self.pi0_state_rot_type == "axis_angle":
+    #         rot, _ = quat_wxyz_tensor_to_axis_angle(rot)
+    #     elif self.pi0_state_rot_type == "rot_6d":
+    #         rot = rotation_conversions.quaternion_to_matrix(rot)
+    #         rot = rotation_conversions.matrix_to_rotation_6d(rot)
+    #     elif self.pi0_state_rot_type == "quat":
+    #         pass
+    #     else:
+    #         raise NotImplemented(f"Unknown pi0_state_rot_type: {self.pi0_state_rot_type}")
 
-        return torch.concat(
-            [pose.get_p(), rot, grasp_qpos.unsqueeze(dim = 1)], dim = 1
-        )
+    #     return torch.concat(
+    #         [pose.get_p(), rot, grasp_qpos.unsqueeze(dim = 1)], dim = 1
+    #     )
+
+    # def _pi0_trans_to_action(self, trans: Pose, grasp_action: torch.Tensor):
+    #     rot = trans.get_q()
+    #     if self.pi0_action_rot_type == "axis_angle":
+    #         rot, _ = quat_wxyz_tensor_to_axis_angle(rot)
+    #     elif self.pi0_action_rot_type == "rot_6d":
+    #         rot = rotation_conversions.quaternion_to_matrix(rot)
+    #         rot = rotation_conversions.matrix_to_rotation_6d(rot)
+    #     elif self.pi0_action_rot_type == "rpy_euler":
+    #         rot = quaternion_to_rpy_eular(rot)
+    #     else:
+    #         raise NotImplemented(f"Unknown pi0_action_rot_type: {self.pi0_action_rot_type}")
+
+    #     return torch.concat(
+    #         [trans.get_p(), rot, grasp_action.unsqueeze(dim = 1)], dim = 1
+    #     )
 
     def _pi0_initalize_episode(self, env_idx: torch.Tensor, options):
         # GPU sim 下显式同步
@@ -542,25 +587,32 @@ class SequentialTaskEnv(SceneManipulationEnv):
             # pi0_eef_state_tl = torch.concat(
             #     [b_tl_eef_tl_pose.get_p(), b_tl_eef_tl_pose.get_q(), self.gripper_state_tl.unsqueeze(dim = 1)], dim = 1
             # )
-            pi0_eef_state_tl = self._pi0_pose_to_state(
-                b_tl_eef_tl_pose, self.gripper_state_tl
+            pi0_eef_state_tl = pose_to_target_type(
+                b_tl_eef_tl_pose, self.pi0_state_rot_type, [self.gripper_state_tl.unsqueeze(dim = 1)]
             )
 
             # 动作：移动底盘坐标系下的末端位移变换（位置 + 固定欧拉角）+ 下一时刻夹爪张开程度
             # 获取基于运动坐标系的 Delta 动作
             eef_tl_trans = w_eef_tl_pose.inv() * w_eef_tc_pose
             # 整理为 Pi0 动作
-            print(f"self._cur_action: {self._cur_action}")
-            pi0_eef_ref_action = torch.concat(
-                [eef_tl_trans.get_p(), quaternion_to_rpy_eular(eef_tl_trans.get_q()), self._cur_action[:, FETCH_GRIPPER_ACT_IDX].unsqueeze(dim = 1)], dim = 1
+            # pi0_eef_ref_action = torch.concat(
+            #     [eef_tl_trans.get_p(), quaternion_to_rpy_eular(eef_tl_trans.get_q()), self._cur_action[:, FETCH_GRIPPER_ACT_IDX].unsqueeze(dim = 1)], dim = 1
+            # )
+            # pi0_eef_ref_action = self._pi0_trans_to_action(eef_tl_trans, self._cur_action[:, FETCH_GRIPPER_ACT_IDX])
+            pi0_eef_ref_action = pose_to_target_type(
+                eef_tl_trans, self.pi0_action_rot_type, [self._cur_action[:, FETCH_GRIPPER_ACT_IDX].unsqueeze(dim = 1)]
             )
 
             # 获取基于基座坐标系的 Delta 动作
             b_tl_eef_tc_pose = b_tl_w_pose * w_eef_tc_pose
             b_tl_trans = b_tl_eef_tc_pose * b_tl_eef_tl_pose.inv()
             # 整理为 Pi0 动作
-            pi0_eef_abs_action = torch.concat(
-                [b_tl_trans.get_p(), quaternion_to_rpy_eular(b_tl_trans.get_q()), self._cur_action[:,FETCH_GRIPPER_ACT_IDX].unsqueeze(dim = 1)], dim = 1
+            # pi0_eef_abs_action = torch.concat(
+            #     [b_tl_trans.get_p(), quaternion_to_rpy_eular(b_tl_trans.get_q()), self._cur_action[:,FETCH_GRIPPER_ACT_IDX].unsqueeze(dim = 1)], dim = 1
+            # )
+            # pi0_eef_abs_action = self._pi0_trans_to_action(b_tl_trans, self._cur_action[:, FETCH_GRIPPER_ACT_IDX])
+            pi0_eef_abs_action = pose_to_target_type(
+                b_tl_trans, self.pi0_action_rot_type, [self._cur_action[:, FETCH_GRIPPER_ACT_IDX].unsqueeze(dim = 1)]
             )
 
             res_info = dict(
@@ -576,8 +628,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
             # pi0_eef_state_tc = torch.concat(
             #     [b_tc_eef_tc_pose.get_p(), b_tc_eef_tc_pose.get_q(), gripper_state_tc.unsqueeze(dim = 1)], dim = 1
             # )
-            pi0_eef_state_tc = self._pi0_pose_to_state(
-                b_tc_eef_tc_pose, gripper_state_tc
+            pi0_eef_state_tc = pose_to_target_type(
+                b_tc_eef_tc_pose, self.pi0_state_rot_type, [gripper_state_tc.unsqueeze(dim = 1)]
             )
 
             res_info = dict(
@@ -863,8 +915,10 @@ class SequentialTaskEnv(SceneManipulationEnv):
         pi0_info_merge_to_extra_obs: bool = False,
         # 推理模式下, 不分析动作, 且输出状态为动作执行后的状态
         pi0_is_infer_mode: bool = False,
-        # pi0 是否使用轴角对位姿观测 (与 Libero 保持一致)
-        pi0_is_angleaxis_state: bool = True,
+        # pi0 观测的姿态表示, 默认为 Rot6D (更适合表示全局姿态), 否则使用轴角对 (与 Libero 保持一致, 更适合表示局部姿态)
+        pi0_state_rot_type: ROT_TYPE = "rot_6d",
+        # pi0 动作的姿态表示, 默认为轴角对 (与 Libero 保持一致, 更适合表示局部姿态), 否则使用 Rot6D (更适合表示全局姿态)
+        pi0_action_rot_type: ROT_TYPE = "axis_angle",
 
         # 启用 RL Policy 所需的 info
         policy_info_enable: bool = True,
@@ -885,7 +939,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
         self.pi0_info_enable = pi0_info_enable
         self.pi0_is_infer_mode = pi0_is_infer_mode
         self.pi0_info_merge_to_extra_obs = pi0_info_merge_to_extra_obs
-        self.pi0_is_angleaxis_state = pi0_is_angleaxis_state
+        self.pi0_state_rot_type: ROT_TYPE = pi0_state_rot_type
+        self.pi0_action_rot_type: ROT_TYPE = pi0_action_rot_type
         if (not self.pi0_info_enable) and self.pi0_info_merge_to_extra_obs:
             warn("将 pi0 信息合并到 extra obs 前需要启用 pi0_info_enable")
             self.pi0_info_merge_to_extra_obs = False
