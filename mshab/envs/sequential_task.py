@@ -457,7 +457,11 @@ class SequentialTaskEnv(SceneManipulationEnv):
                         f"PlaceSubtask at index {subtask_num} has no goal actor"
                     )
 
-                target_pose_world[env_idx] = vectorize_pose(target_goal.pose)[env_idx]
+                # 防止 place 目标点过低的问题
+                place_pose = Pose(target_goal.pose.raw_pose)
+                place_pose = place_pose * Pose.create_from_pq(p = torch.tensor([-0.1, 0, 0]))
+
+                target_pose_world[env_idx] = vectorize_pose(place_pose)[env_idx]
                 is_pick[env_idx] = False
 
             else:
@@ -468,6 +472,17 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
         return target_pose_world, is_pick
     
+    def get_special_pose(self, pose_name: Optional[str] = None):
+        if pose_name == "tcp" or pose_name == None:
+            use_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
+        elif pose_name == "target":
+            target_pose_world, is_pick = self.get_pick_place_target_pose_world()
+            use_pose = Pose(target_pose_world)
+        else:
+            raise NotImplementedError("尚未实现引用其他位姿")
+        
+        return use_pose
+
     ### 通用
 
     def step(self, action):
@@ -559,7 +574,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         self.last_tcp_pose_raw[env_idx] = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose.raw_pose
 
         # 缓存上一步夹爪状态
-        self.gripper_state_tl = self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX[0]] / FETCH_GRIPPER_OPEN_QPOS
+        self.gripper_state_tl = torch.mean(self.agent.robot.get_qpos()[:, FETCH_GRIPPER_QPOS_IDX], dim = 1)
 
     def _pi0_evaluate(self):
         ### 转化为 Pi0 标准动作
@@ -657,13 +672,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         env_idx: Optional[int] = None
     ):
         if not isinstance(new_pose, Pose):
-            if new_pose == "tcp" or new_pose == None:
-                use_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
-            elif new_pose == "target":
-                target_pose_world, is_pick = self.get_pick_place_target_pose_world()
-                use_pose = Pose(target_pose_world)
-            else:
-                raise NotImplementedError("尚未实现引用其他位姿")
+            use_pose = self.get_special_pose(new_pose)
         else:
             use_pose = new_pose
 
