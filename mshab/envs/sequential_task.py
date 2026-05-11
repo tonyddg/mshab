@@ -1,6 +1,6 @@
 import copy
 from collections import defaultdict
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 from warnings import warn
 
 import numpy as np
@@ -143,6 +143,35 @@ def pose_to_target_type(pose: Pose, rot_type: ROT_TYPE, addition_state: List = [
     return torch.concat(
         [pose.get_p(), rot] + addition_state, dim = 1
     )
+
+VIS_AXIS_RADIUS = 0.01
+VIS_AXIS_LENGTH = 0.05
+
+from mani_skill.utils.building.actor_builder import ActorBuilder
+from mani_skill.utils.structs.actor import Actor
+
+def make_vis_axis(
+    axis_builder: ActorBuilder
+):
+    axis_builder.add_cylinder_visual(
+        radius = VIS_AXIS_RADIUS,
+        half_length = VIS_AXIS_LENGTH,
+        material = (1, 0, 0),
+        pose = sapien.Pose(p = [VIS_AXIS_LENGTH, 0, 0])
+    )
+    axis_builder.add_cylinder_visual(
+        radius = VIS_AXIS_RADIUS,
+        half_length = VIS_AXIS_LENGTH,
+        material = (0, 1, 0),
+        pose = sapien.Pose(p = [0, VIS_AXIS_LENGTH, 0], q = np.asarray(euler2quat(0, 0, np.deg2rad(-90)), dtype = np.float32))
+    )
+    axis_builder.add_cylinder_visual(
+        radius = VIS_AXIS_RADIUS,
+        half_length = VIS_AXIS_LENGTH,
+        material = (0, 0, 1),
+        pose = sapien.Pose(p = [0, 0, VIS_AXIS_LENGTH], q = np.asarray(euler2quat(0, np.deg2rad(90), 0), dtype = np.float32))
+    )
+    return axis_builder
 
 ##### 辅助函数 #####
 
@@ -649,8 +678,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
             res_info = dict(
                 pi0_eef_state = pi0_eef_state_tc,
-                pi0_eef_ref_action = None,
-                pi0_eef_abs_action = None,
+                # pi0_eef_ref_action = None,
+                # pi0_eef_abs_action = None,
             )
 
         # 更新记录
@@ -698,24 +727,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         goal_point_builder = self.scene.create_actor_builder()
         
         if self.policy_show_goal_axis:
-            goal_point_builder.add_cylinder_visual(
-                radius = self.GOAL_POINT_VIS_RADIUS,
-                half_length = self.GOAL_POINT_VIS_LENGTH,
-                material = (1, 0, 0),
-                pose = sapien.Pose(p = [self.GOAL_POINT_VIS_LENGTH, 0, 0])
-            )
-            goal_point_builder.add_cylinder_visual(
-                radius = self.GOAL_POINT_VIS_RADIUS,
-                half_length = self.GOAL_POINT_VIS_LENGTH,
-                material = (0, 1, 0),
-                pose = sapien.Pose(p = [0, self.GOAL_POINT_VIS_LENGTH, 0], q = np.asarray(euler2quat(0, 0, np.deg2rad(-90)), dtype = np.float32))
-            )
-            goal_point_builder.add_cylinder_visual(
-                radius = self.GOAL_POINT_VIS_RADIUS,
-                half_length = self.GOAL_POINT_VIS_LENGTH,
-                material = (0, 0, 1),
-                pose = sapien.Pose(p = [0, 0, self.GOAL_POINT_VIS_LENGTH], q = np.asarray(euler2quat(0, np.deg2rad(90), 0), dtype = np.float32))
-            )
+            goal_point_builder = make_vis_axis(goal_point_builder)
         else:
             goal_point_builder.add_cylinder_visual(
                 radius = self.GOAL_POINT_VIS_RADIUS,
@@ -731,25 +743,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         # 末端指示体
         if self.policy_show_goal_axis:
             tcp_point_builder = self.scene.create_actor_builder()
-        
-            tcp_point_builder.add_cylinder_visual(
-                radius = self.GOAL_POINT_VIS_RADIUS,
-                half_length = self.GOAL_POINT_VIS_LENGTH,
-                material = (1, 0, 0),
-                pose = sapien.Pose(p = [self.GOAL_POINT_VIS_LENGTH, 0, 0])
-            )
-            tcp_point_builder.add_cylinder_visual(
-                radius = self.GOAL_POINT_VIS_RADIUS,
-                half_length = self.GOAL_POINT_VIS_LENGTH,
-                material = (0, 1, 0),
-                pose = sapien.Pose(p = [0, self.GOAL_POINT_VIS_LENGTH, 0], q = np.asarray(euler2quat(0, 0, np.deg2rad(-90)), dtype = np.float32))
-            )
-            tcp_point_builder.add_cylinder_visual(
-                radius = self.GOAL_POINT_VIS_RADIUS,
-                half_length = self.GOAL_POINT_VIS_LENGTH,
-                material = (0, 0, 1),
-                pose = sapien.Pose(p = [0, 0, self.GOAL_POINT_VIS_LENGTH], q = np.asarray(euler2quat(0, np.deg2rad(90), 0), dtype = np.float32))
-            )
+            tcp_point_builder = make_vis_axis(tcp_point_builder)
 
             tcp_point_builder.set_initial_pose(sapien.Pose(p = [0, 0, 0], q = [1, 0, 0, 0]))
             self.tcp_point = tcp_point_builder.build_kinematic(name = "tcp_point")
@@ -860,9 +854,51 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
         return np.asarray(encoded, dtype=f"S{self.TARGET_RECEPTACLE_MAX_BYTES}")
 
+    ### 位姿进行可视化函数
+
+    def _vis_pose_load_scene(self, options):
+        if self.num_vis_pose <= 0:
+            return
+
+        self.vis_pose_actor_list: list[Actor] = []
+        for i in range(self.num_vis_pose):
+            vis_pose_builder = self.scene.create_actor_builder()
+            vis_pose_builder = make_vis_axis(vis_pose_builder)
+
+            vis_pose_builder.set_initial_pose(sapien.Pose(p = [0, 0, 0], q = [1, 0, 0, 0]))
+            vis_pose_actor = vis_pose_builder.build_kinematic(name = f"vis_pose_{i}")
+
+            self.vis_pose_actor_list.append(vis_pose_actor)
+            self._hidden_objects.append(vis_pose_actor)
+
+    def reset_vis_pose(
+        self
+    ):
+        if self.num_vis_pose <= 0:
+            warn(f"vis pose is disable as num_vis_pose is {self.num_vis_pose}")
+            return
+        
+        for i in range(self.num_vis_pose):
+            self.vis_pose_actor_list[i].set_pose(sapien.Pose())
+
+    def set_vis_pose(
+        self,
+        vis_pose: Sequence[Union[sapien.Pose, Pose]]
+    ):
+        '''
+        对位姿进行可视化, 仅可视化前 self.num_vis_pose 个位姿
+        '''
+        if self.num_vis_pose <= 0:
+            warn(f"vis pose is disable as num_vis_pose is {self.num_vis_pose}")
+            return
+        
+        num_use_pose = min(len(vis_pose), self.num_vis_pose)
+        for i in range(num_use_pose):
+            self.vis_pose_actor_list[i].set_pose(vis_pose[i])
+
     ###
 
-    SUPPORTED_ROBOTS = ["fetch", "fetch_modified"]
+    SUPPORTED_ROBOTS = ["fetch", "fetch_modified", "fetch_origin_like"]
     agent: Fetch
 
     EE_REST_POS_WRT_BASE = (0.5, 0, 1.25)
@@ -938,6 +974,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
         # 记录容器信息
         receptacles_enable: bool = True,
+        # 最大可视位姿数
+        num_vis_pose: int = 0,
 
         # TODO: 自定义结束位姿
         custom_reset_ee_pose: Optional[Pose] = None,
@@ -962,7 +1000,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
             self.policy_info_merge_to_extra_obs = False
 
         self.receptacles_enable = receptacles_enable
-        
+        self.num_vis_pose = num_vis_pose
+
         self.task_cfgs: Dict[str, SubtaskConfig] = dict(
             pick=self.pick_cfg,
             place=self.place_cfg,
@@ -1571,6 +1610,9 @@ class SequentialTaskEnv(SceneManipulationEnv):
         ### 用于 RL 策略
         if self.policy_info_enable:
             self._policy_load_scene(options)
+        ### 用于 目标定可视化
+        if self.num_vis_pose > 0:
+            self._vis_pose_load_scene(options)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options):
         with torch.device(self.device):
@@ -2416,11 +2458,18 @@ class SequentialTaskEnv(SceneManipulationEnv):
     
         ###
         if self.pi0_info_merge_to_extra_obs and self.pi0_info_enable:
-            origin_extra_obs.update(dict(
-                pi0_eef_state = info["pi0_eef_state"],
-                pi0_eef_ref_action = info["pi0_eef_ref_action"],
-                pi0_eef_abs_action = info["pi0_eef_abs_action"],
-            ))
+            if self.pi0_is_infer_mode:
+                origin_extra_obs.update(dict(
+                    pi0_eef_state = info["pi0_eef_state"],
+                    # pi0_eef_ref_action = info["pi0_eef_ref_action"],
+                    # pi0_eef_abs_action = info["pi0_eef_abs_action"],
+                ))
+            else:
+                origin_extra_obs.update(dict(
+                    pi0_eef_state = info["pi0_eef_state"],
+                    pi0_eef_ref_action = info["pi0_eef_ref_action"],
+                    pi0_eef_abs_action = info["pi0_eef_abs_action"],
+                ))
         if self.policy_info_merge_to_extra_obs and self.policy_info_enable:
             origin_extra_obs.update(dict(
                 qpos = info["qpos"],
