@@ -754,69 +754,71 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
     def _policy_evaluate(self):
         
-        ### 角度检查
-        eef_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
-        pose_diff = eef_pose.inv() * self.goal_point.pose # type: ignore
-        assert isinstance(pose_diff, Pose)
-
-        # 使用底盘坐标系下的差向量而不是末端或目标
-        base_pose_inv = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose.inv()
-        base_eef_pose = base_pose_inv * eef_pose
-        base_goal_pose = base_pose_inv * self.goal_point.pose
-        
-        loc_diff = base_eef_pose.get_p() - base_goal_pose.get_p()
-        loc_error = torch.norm(loc_diff, dim = 1)
-        # print(f"loc_diff: {loc_diff}")
-        rotvec_diff, rot_error = quat_wxyz_tensor_to_axis_angle(pose_diff.get_q())
-
-        print(f"rotvec_diff: {rotvec_diff}")
-        print(f"loc_diff: {loc_diff}")
-
-        ### 底盘信息
-        # 底盘信息 (统一为底盘坐标系, 不考虑 z 方向, 即 XOY 平面投影)
-        base_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
-        base_pose_inv = base_pose.inv()
-
-        if getattr(self, "robot_forward_in_base_link_tensor", None) is None:
-            self.robot_forward_in_base_link_tensor = torch.as_tensor(
-                FETCH_FORWARD_IN_BASE_LINK, dtype=torch.float32, device=self.device
-            )
-        # 认为底盘紧贴底面, z 分量为 (0, 0, 1)
-        goal_loc = (base_pose_inv * self.goal_point.pose).get_p()[:, 0:2]
-        # (保留以兼容旧的奖励函数) 认为底盘紧贴底面, 底盘前进方向即底盘坐标系 (1, 0, 0) 方向, z 分量为 (0, 0, 1)
-        base_forward = torch.zeros_like(goal_loc) # base_T[:, :2, :2] @ self.robot_forward_in_base_link_tensor
-        base_forward[:, 0] = 1
-        # (保留以兼容旧的奖励函数) 使用底盘坐标系时 base_loc 总为 (0, 0)
-        base_loc = torch.zeros_like(goal_loc)# base_T[:, 0:2, 3]
-
-        base2goal_vec = torch.as_tensor(goal_loc - base_loc)
-        
         ### 相机位姿
         base_world_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose.inv()
         # 头部相机坐标系在基座下的座标系
         world_head_camera_pose = self.agent.robot.find_link_by_name(FETCH_HEAD_CAMERA_LINK).pose
         # 手部相机坐标系在基座下的坐标系
         world_gripper_camera_pose = self.agent.robot.find_link_by_name(FETCH_GRIPPER_CAMERA_LINK).pose
-        
+
         addition_info = dict(
-            
             # MSHAB 对原始 qpos 进行了裁剪, 此处重新获取原始 qpos 便于与已有模块衔接
             qpos = self.agent.robot.get_qpos(),
-
-            rot_error = rot_error,
-            loc_error = loc_error,
-            
-            loc_diff = loc_diff,
-            rotvec_diff = rotvec_diff,
-
-            base_forward = base_forward,
-            base2goal_vec = base2goal_vec,
-
             last_action = self._last_action,
 
             head_camera_t = (base_world_pose * world_head_camera_pose).to_transformation_matrix(),
             gripper_camera_t = (base_world_pose * world_gripper_camera_pose).to_transformation_matrix(),
         )
+
+        if not self.policy_bc_policy_mode:
+            ### 角度检查
+            eef_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
+            pose_diff = eef_pose.inv() * self.goal_point.pose # type: ignore
+            assert isinstance(pose_diff, Pose)
+
+            # 使用底盘坐标系下的差向量而不是末端或目标
+            base_pose_inv = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose.inv()
+            base_eef_pose = base_pose_inv * eef_pose
+            base_goal_pose = base_pose_inv * self.goal_point.pose
+            
+            loc_diff = base_eef_pose.get_p() - base_goal_pose.get_p()
+            loc_error = torch.norm(loc_diff, dim = 1)
+            # print(f"loc_diff: {loc_diff}")
+            rotvec_diff, rot_error = quat_wxyz_tensor_to_axis_angle(pose_diff.get_q())
+
+            print(f"rotvec_diff: {rotvec_diff}")
+            print(f"loc_diff: {loc_diff}")
+
+            ### 底盘信息
+            # 底盘信息 (统一为底盘坐标系, 不考虑 z 方向, 即 XOY 平面投影)
+            base_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
+            base_pose_inv = base_pose.inv()
+
+            if getattr(self, "robot_forward_in_base_link_tensor", None) is None:
+                self.robot_forward_in_base_link_tensor = torch.as_tensor(
+                    FETCH_FORWARD_IN_BASE_LINK, dtype=torch.float32, device=self.device
+                )
+            # 认为底盘紧贴底面, z 分量为 (0, 0, 1)
+            goal_loc = (base_pose_inv * self.goal_point.pose).get_p()[:, 0:2]
+            # (保留以兼容旧的奖励函数) 认为底盘紧贴底面, 底盘前进方向即底盘坐标系 (1, 0, 0) 方向, z 分量为 (0, 0, 1)
+            base_forward = torch.zeros_like(goal_loc) # base_T[:, :2, :2] @ self.robot_forward_in_base_link_tensor
+            base_forward[:, 0] = 1
+            # (保留以兼容旧的奖励函数) 使用底盘坐标系时 base_loc 总为 (0, 0)
+            base_loc = torch.zeros_like(goal_loc)# base_T[:, 0:2, 3]
+
+            base2goal_vec = torch.as_tensor(goal_loc - base_loc)
+
+            addition_info.update(dict(
+                rot_error = rot_error,
+                loc_error = loc_error,
+                
+                loc_diff = loc_diff,
+                rotvec_diff = rotvec_diff,
+
+                base_forward = base_forward,
+                base2goal_vec = base2goal_vec,
+            ))
+
         return addition_info
     
     ### 载入容器信息
@@ -967,6 +969,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
 
         # 启用 RL Policy 所需的 info
         policy_info_enable: bool = True,
+        # 仅记录训练有监督策略所需的信息 (当前仅记录相机变换、last action 与 qpos) 
+        policy_bc_policy_mode: bool = False,
         # 将 RL policy 信息合并到 extra obs 中
         policy_info_merge_to_extra_obs: bool = True,
         # 显示末端与目标的坐标系
@@ -993,6 +997,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
             self.pi0_info_merge_to_extra_obs = False
         
         self.policy_info_enable = policy_info_enable
+        self.policy_bc_policy_mode = policy_bc_policy_mode
         self.policy_show_goal_axis = policy_show_goal_axis
         self.policy_info_merge_to_extra_obs = policy_info_merge_to_extra_obs
         if (not self.policy_info_enable) and self.policy_info_merge_to_extra_obs:
@@ -2473,21 +2478,23 @@ class SequentialTaskEnv(SceneManipulationEnv):
         if self.policy_info_merge_to_extra_obs and self.policy_info_enable:
             origin_extra_obs.update(dict(
                 qpos = info["qpos"],
-
-                rot_error = info["rot_error"],
-                loc_error = info["loc_error"],
-
-                loc_diff = info["loc_diff"],
-                rotvec_diff = info["rotvec_diff"],
-
-                base_forward = info["base_forward"],
-                base2goal_vec = info["base2goal_vec"],
-
                 last_action = info["last_action"],
 
                 head_camera_t = info["head_camera_t"],
                 gripper_camera_t = info["gripper_camera_t"]
             ))
+
+            if not self.policy_bc_policy_mode:
+                origin_extra_obs.update(dict(
+                    rot_error = info["rot_error"],
+                    loc_error = info["loc_error"],
+
+                    loc_diff = info["loc_diff"],
+                    rotvec_diff = info["rotvec_diff"],
+
+                    base_forward = info["base_forward"],
+                    base2goal_vec = info["base2goal_vec"],
+                ))
 
         return origin_extra_obs
 

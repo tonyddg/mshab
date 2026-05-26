@@ -123,7 +123,8 @@ def eval(
         ),
         extra_stat_keys=[],
         env_kwargs=dict(
-            require_build_configs_repeated_equally_across_envs=False,
+            require_build_configs_repeated_equally_across_envs=True,
+
             add_event_tracker_info=True,
             robot_force_mult=0.001,
             robot_force_penalty_min=0.2,
@@ -133,14 +134,19 @@ def eval(
             pi0_info_merge_to_extra_obs = False,
             pi0_is_infer_mode = False,
 
-            policy_info_enable = False,
+            policy_info_enable = True,
+            policy_bc_policy_mode = True,
+            policy_show_goal_axis = False,
             policy_info_merge_to_extra_obs = False,
+
             receptacles_enable = True,
         ),
     )
+
+    MSHAB_TRAJECT_DIR = os.getenv("MSHAB_TRAJECT_DIR", (ASSET_DIR / "../mshab_custom_trajectory").resolve().as_posix())
     logger_cfg = LoggerConfig(
         ### 日志与轨迹的保存路径
-        workspace="/mnt/dataset/xzmyuq/dataset/mshab_custom_trajectory",
+        workspace=MSHAB_TRAJECT_DIR,
         exp_name=(
             (
                 f"gen_data_save_trajectories/{task}/{subtask}/{split}/{obj_name}"
@@ -477,5 +483,7 @@ def eval(
 
 if __name__ == "__main__":
     import sys
+    import dotenv
+    dotenv.load_dotenv()
 
     eval(task=sys.argv[1], subtask=sys.argv[2], obj_name=sys.argv[3])
