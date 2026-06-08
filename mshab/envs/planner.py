@@ -80,7 +80,7 @@ class SubtaskConfig:
     task_id: int
     horizon: int = 200
     robot_cumulative_force_limit: float = torch.inf
-    ee_rest_thresh: float = 0.05
+    ee_rest_thresh: float = 0.1 # 0.05
     robot_resting_qpos_tolerance: float = 0.2
     robot_resting_qpos_tolerance_grasping: float = 0.6
 

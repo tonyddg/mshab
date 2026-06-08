@@ -173,6 +173,28 @@ def make_vis_axis(
     )
     return axis_builder
 
+def get_grasp_force_angle(agent, object: Actor):
+    """获取最小夹持力与最大夹持角度 (越接近 0 越好, 说明接触力与接触方向平行)
+
+    Args:
+        object (Actor): The object to check if the robot is grasping
+    """
+    l_contact_forces = agent.scene.get_pairwise_contact_forces(
+        agent.finger1_link, object
+    )
+    r_contact_forces = agent.scene.get_pairwise_contact_forces(
+        agent.finger2_link, object
+    )
+    lforce = torch.linalg.norm(l_contact_forces, axis=1)
+    rforce = torch.linalg.norm(r_contact_forces, axis=1)
+
+    # direction to open the gripper
+    ldirection = -agent.finger1_link.pose.to_transformation_matrix()[..., :3, 1]
+    rdirection = agent.finger2_link.pose.to_transformation_matrix()[..., :3, 1]
+    langle = common.compute_angle_between(ldirection, l_contact_forces)
+    rangle = common.compute_angle_between(rdirection, r_contact_forces)
+    return torch.minimum(lforce, rforce), torch.maximum(langle, rangle)
+
 ##### 辅助函数 #####
 
 # TODO: 测试放置的情况
@@ -526,8 +548,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
         if self.policy_info_enable:
             if self.tcp_point is not None:
                 self.tcp_point.set_pose(self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose)
-        # 更新上一时刻动作
-        self._last_action = self._cur_action
+        # 更新上一时刻动作 (使用拷贝赋值防止泄露)
+        self._last_action = self._cur_action.clone()
 
         return step_result
 
@@ -546,6 +568,10 @@ class SequentialTaskEnv(SceneManipulationEnv):
                 else:
                     # 假定 step 均为 Tensor
                     self._cur_action[env_idx] = 0
+
+                # 使 evaluate() 的缓存失效，确保重置后首次调用会重新计算
+                self._last_eval_elapsed_steps = None
+                self._cached_eval_result = None
 
     ### Pi0
 
@@ -786,8 +812,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
             # print(f"loc_diff: {loc_diff}")
             rotvec_diff, rot_error = quat_wxyz_tensor_to_axis_angle(pose_diff.get_q())
 
-            print(f"rotvec_diff: {rotvec_diff}")
-            print(f"loc_diff: {loc_diff}")
+            # print(f"rotvec_diff: {rotvec_diff}")
+            # print(f"loc_diff: {loc_diff}")
 
             ### 底盘信息
             # 底盘信息 (统一为底盘坐标系, 不考虑 z 方向, 即 XOY 平面投影)
@@ -906,12 +932,12 @@ class SequentialTaskEnv(SceneManipulationEnv):
     EE_REST_POS_WRT_BASE = (0.5, 0, 1.25)
     pick_cfg = PickSubtaskConfig(
         horizon=200,
-        ee_rest_thresh=0.05,
+        ee_rest_thresh= 0.1, # 0.05,
     )
     place_cfg = PlaceSubtaskConfig(
         horizon=200,
         obj_goal_thresh=0.15,
-        ee_rest_thresh=0.05,
+        ee_rest_thresh= 0.1, # 0.05,
     )
     navigate_cfg = NavigateSubtaskConfig(
         horizon=500,
@@ -976,13 +1002,13 @@ class SequentialTaskEnv(SceneManipulationEnv):
         # 显示末端与目标的坐标系
         policy_show_goal_axis: bool = True,
 
+        # 是否使用详细的成功判断 info (ee_rest 距离与 grasp_angle)
+        detailed_success_checker_enable: bool = True,
+
         # 记录容器信息
         receptacles_enable: bool = True,
         # 最大可视位姿数
         num_vis_pose: int = 0,
-
-        # TODO: 自定义结束位姿
-        custom_reset_ee_pose: Optional[Pose] = None,
 
         **kwargs,
     ):
@@ -1003,6 +1029,8 @@ class SequentialTaskEnv(SceneManipulationEnv):
         if (not self.policy_info_enable) and self.policy_info_merge_to_extra_obs:
             warn("将 policy 信息合并到 extra obs 前需要启用 policy_info_enable")
             self.policy_info_merge_to_extra_obs = False
+        
+        self.detailed_success_checker_enable = detailed_success_checker_enable
 
         self.receptacles_enable = receptacles_enable
         self.num_vis_pose = num_vis_pose
@@ -1712,6 +1740,14 @@ class SequentialTaskEnv(SceneManipulationEnv):
     # -------------------------------------------------------------------------------------------------
 
     def evaluate(self):
+        # 幂等性保护：同一时间步多次调用时，直接返回缓存结果，
+        # 避免 robot_cumulative_force、subtask_steps_left 等状态被重复修改
+        cur_elapsed = getattr(self, "_elapsed_steps", None)
+        if cur_elapsed is not None:
+            last_eval = getattr(self, "_last_eval_elapsed_steps", None)
+            cached = getattr(self, "_cached_eval_result", None)
+            if last_eval is not None and cached is not None and torch.equal(cur_elapsed, last_eval):
+                return cached
 
         robot_force = (
             self.agent.robot.get_net_contact_forces(self.force_articulation_link_ids)
@@ -1802,6 +1838,10 @@ class SequentialTaskEnv(SceneManipulationEnv):
         # # Debug
         # target_pose_world, is_pick = self.get_pick_place_target_pose_world()
         # print(f"target_pose_world {target_pose_world}, is_pick {is_pick}")
+
+        # 缓存本次计算结果，供同一时间步的后续调用复用
+        self._last_eval_elapsed_steps = cur_elapsed.clone() if cur_elapsed is not None else None
+        self._cached_eval_result = origin_info
 
         return origin_info
 
@@ -1963,6 +2003,26 @@ class SequentialTaskEnv(SceneManipulationEnv):
                 ],
                 dim=1,
             )
+
+        if self.detailed_success_checker_enable:
+            ee_rest_err = torch.norm(
+                self.agent.tcp_pose.p[env_idx] - self.ee_rest_world_pose.p[env_idx],
+                dim=1,
+            )
+            min_force, max_angle = get_grasp_force_angle(self.agent, obj)
+
+            subtask_checkers.update(dict(
+                ee_rest_err = ee_rest_err,
+                min_force = min_force,
+                max_angle = torch.rad2deg(max_angle),
+            ))
+
+        # print("============== success checker: ")
+        # print(f"is_grasped: {is_grasped}")
+        # print(f"ee_rest: {ee_rest}, ee_remain: {ee_remain.item():.2f}")
+        # print(f"is_static: {is_static}")
+        # print(f"cumulative_force_within_limit: {cumulative_force_within_limit}, force: {self.robot_cumulative_force[env_idx].item():.3f}")
+
         return (
             is_grasped
             & ee_rest

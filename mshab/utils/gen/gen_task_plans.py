@@ -420,6 +420,8 @@ def gen_open_task_plans(scene_builder):
             actor_id, actor_num = get_name_num(actor_id)
             articulation_id, articulation_num = get_name_num(base_articulation_id)
 
+            target_receptacles = base_articulation_id
+
             relevant_markers = [
                 m for m in markers if m["params"]["object"] == base_articulation_id
             ]
@@ -486,6 +488,8 @@ def gen_open_task_plans(scene_builder):
                             articulation_relative_handle_pos=articulation_marker[
                                 "params"
                             ]["offset"],
+
+                            target_receptacles = [target_receptacles],
                         )
                     ],
                     build_config_name=build_config_name,
@@ -521,6 +525,8 @@ def gen_close_task_plans(scene_builder):
         ):
             actor_id, actor_num = get_name_num(actor_id)
             articulation_id, articulation_num = get_name_num(base_articulation_id)
+
+            target_receptacles = base_articulation_id
 
             relevant_markers = [
                 m for m in markers if m["params"]["object"] == base_articulation_id
@@ -592,6 +598,8 @@ def gen_close_task_plans(scene_builder):
                                 if articulation_id == "kitchen_counter"
                                 else None
                             ),
+
+                            target_receptacles = [target_receptacles],
                         )
                     ],
                     build_config_name=build_config_name,
