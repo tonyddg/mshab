@@ -542,14 +542,18 @@ class SequentialTaskEnv(SceneManipulationEnv):
             self._cur_action[:] = action.clone()
         else:
             self._cur_action[:] = torch.tensor(action, device = self.device)
+        # 主动限制记录的 action 范围 (MSHAB 默认不会限制 action 范围, 但仅 [-1, 1] 有效)
+        self._cur_action = torch.clip(self._cur_action, -1, 1)
+
+        # 立即更新上一时刻动作 (必须在 super().step() 之前，否则 evaluate() →
+        # _policy_evaluate() 读取到的 _last_action 会落后一个时间步)
+        self._last_action = self._cur_action.clone()
 
         step_result = super().step(action)
 
         if self.policy_info_enable:
             if self.tcp_point is not None:
                 self.tcp_point.set_pose(self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose)
-        # 更新上一时刻动作 (使用拷贝赋值防止泄露)
-        self._last_action = self._cur_action.clone()
 
         return step_result
 
@@ -2040,6 +2044,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
         env_idx: torch.Tensor,
         check_progressive_completion=False,
     ):
+
         is_grasped = self.agent.is_grasping(obj, max_angle=30)[env_idx]
         if self.place_cfg.goal_type == "zone":
             # (0 <= AM•AB <= AB•AB) and (0 <= AM•AD <=  AD•AD)
@@ -2135,6 +2140,90 @@ class SequentialTaskEnv(SceneManipulationEnv):
                 ],
                 dim=1,
             )
+
+        if self.detailed_success_checker_enable:
+            ee_rest_err = torch.norm(
+                self.agent.tcp_pose.p[env_idx] - self.ee_rest_world_pose.p[env_idx],
+                dim=1,
+            )
+
+            # Zone Check
+            def zone_check(goal_rectangle_corners_ = goal_rectangle_corners, goal_z_ = obj_goal.pose.p[env_idx, 2]):
+                As, Bs, Ds = (
+                    goal_rectangle_corners_[env_idx, 0, :2],
+                    goal_rectangle_corners_[env_idx, 1, :2],
+                    goal_rectangle_corners_[env_idx, 3, :2],
+                )
+                Ms = obj.pose.p[env_idx, :2]
+
+                AM = Ms - As
+                AB = Bs - As
+                AD = Ds - As
+
+                AM_dot_AB = torch.sum(AM * AB, dim=1)
+                AB_dot_AB = torch.sum(AB * AB, dim=1)
+                AM_dot_AD = torch.sum(AM * AD, dim=1)
+                AD_dot_AD = torch.sum(AD * AD, dim=1)
+
+                xy_correct_zone = (
+                    (0 <= AM_dot_AB)
+                    & (AM_dot_AB <= AB_dot_AB)
+                    & (0 <= AM_dot_AD)
+                    & (AM_dot_AD <= AD_dot_AD)
+                )
+
+                z_float_zone = torch.abs(obj.pose.p[env_idx, 2] - goal_z_)
+                return (z_float_zone, xy_correct_zone)
+
+            target_receptacle = self._get_current_target_receptacles_info()[env_idx].astype(str)
+
+            # val 的 kitchen_counter 在 place 时可能放在水槽里或桌面上 
+            if target_receptacle == "kitchen_counter_:0000":
+
+                goal_rectangle_corners_in_right = torch.tensor([[
+                    [-1.8764, -1.7739,  0.8767], # -1.6519
+                    [-2.4863, -1.7739,  0.8767], # -1.6519
+                    [-2.4863, -0.1399,  0.8767],
+                    [-1.8764, -0.1399,  0.8767]]
+                ])
+                goal_z_in_right = torch.tensor([0.9292])
+ 
+                goal_rectangle_corners_in_left = torch.tensor([[
+                    [-1.8435, -3.1905,  0.8767],
+                    [-2.4736, -3.1905,  0.8767],
+                    [-2.4736, -2.1351,  0.8767], # -2.2740
+                    [-1.8435, -2.1351,  0.8767]] # -2.2740
+                ])
+                goal_z_in_left = torch.tensor([0.9292])
+                
+                goal_rectangle_corners_in_sink = torch.tensor([[
+                    [-1.8435, -2.1351,  0.7267], # -2.0511
+                    [-2.4736, -2.1351,  0.7267], # -2.2746
+                    [-2.4736, -1.7739,  0.7267], # -2.2746
+                    [-1.8435, -1.7739,  0.7267]  # -2.0511
+                ]])
+                goal_z_in_sink = torch.tensor([0.7767])
+
+                z_float_zone_right, xy_correct_zone_right = zone_check(goal_rectangle_corners_in_right, goal_z_in_right)
+                z_float_zone_left, xy_correct_zone_left = zone_check(goal_rectangle_corners_in_left, goal_z_in_left)
+                z_float_zone_sink, xy_correct_zone_sink = zone_check(goal_rectangle_corners_in_sink, goal_z_in_sink)
+
+                # print(f"z_float_zone_right, xy_correct_zone_right: {z_float_zone_right}, {xy_correct_zone_right}")
+                # print(f"z_float_zone_left, xy_correct_zone_left: {z_float_zone_left}, {xy_correct_zone_left}")
+                # print(f"z_float_zone_sink, xy_correct_zone_sink: {z_float_zone_sink}, {xy_correct_zone_sink}")
+
+                z_float_zone = torch.tensor(min(z_float_zone_right.item(), z_float_zone_left.item(), z_float_zone_sink.item()))
+                xy_correct_zone = torch.tensor(xy_correct_zone_right.item() or xy_correct_zone_left.item() or xy_correct_zone_sink.item())
+
+            else:
+                z_float_zone, xy_correct_zone = zone_check()
+
+            subtask_checkers.update(dict(
+                ee_rest_err = ee_rest_err,
+                z_float = z_float_zone,
+                xy_correct = xy_correct_zone
+            ))
+
         return (
             ~is_grasped
             & obj_at_goal
@@ -2343,6 +2432,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
             is_static=is_static,
             cumulative_force_within_limit=cumulative_force_within_limit,
         )
+
         if self._add_event_tracker_info:
             subtask_checkers["handle_active_joint_qpos"] = articulation.qpos[
                 env_idx, active_joint_idx
@@ -2364,6 +2454,16 @@ class SequentialTaskEnv(SceneManipulationEnv):
                 )[env_idx],
                 dim=1,
             )
+
+        if self.detailed_success_checker_enable:
+            ee_rest_err = torch.norm(
+                self.agent.tcp_pose.p[env_idx] - self.ee_rest_world_pose.p[env_idx],
+                dim=1,
+            )
+            subtask_checkers.update(dict(
+                ee_rest_err = ee_rest_err,
+            ))
+
         return (
             articulation_open
             & ee_rest
@@ -2438,6 +2538,16 @@ class SequentialTaskEnv(SceneManipulationEnv):
                 )[env_idx],
                 dim=1,
             )
+
+        if self.detailed_success_checker_enable:
+            ee_rest_err = torch.norm(
+                self.agent.tcp_pose.p[env_idx] - self.ee_rest_world_pose.p[env_idx],
+                dim=1,
+            )
+            subtask_checkers.update(dict(
+                ee_rest_err = ee_rest_err,
+            ))
+
         return (
             articulation_closed
             & ee_rest
