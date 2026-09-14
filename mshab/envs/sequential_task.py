@@ -850,6 +850,23 @@ class SequentialTaskEnv(SceneManipulationEnv):
             ))
 
         return addition_info
+
+    # ik policy
+
+    def _ik_evaluate(self):
+        
+
+        # 世界坐标系下的底盘位姿
+        base_pose = self.agent.robot.find_link_by_name(FETCH_BASE_LINK_NAME).pose
+        # 世界坐标系下的末端位姿
+        eef_pose = self.agent.robot.find_link_by_name(FETCH_TCP_LINK_NAME).pose
+
+        # TODO
+        addition_info = dict(
+            base_pose_wrt_world = vectorize_pose(base_pose),
+            eef_pose_wrt_world = vectorize_pose(eef_pose),
+        )
+        return addition_info
     
     ### 载入容器信息
     TARGET_RECEPTACLE_MAX_BYTES = 64
@@ -1006,6 +1023,11 @@ class SequentialTaskEnv(SceneManipulationEnv):
         # 显示末端与目标的坐标系
         policy_show_goal_axis: bool = True,
 
+        # IK Policy 所需的额外 info (底盘的绝对位姿、末端的绝对位姿)
+        ik_info_enable: bool = False,
+        # 将 IK policy 信息合并到 extra obs 中
+        ik_info_merge_to_extra_obs: bool = False,
+
         # 是否使用详细的成功判断 info (ee_rest 距离与 grasp_angle)
         detailed_success_checker_enable: bool = True,
 
@@ -1025,7 +1047,13 @@ class SequentialTaskEnv(SceneManipulationEnv):
         if (not self.pi0_info_enable) and self.pi0_info_merge_to_extra_obs:
             warn("将 pi0 信息合并到 extra obs 前需要启用 pi0_info_enable")
             self.pi0_info_merge_to_extra_obs = False
-        
+
+        self.ik_info_merge_to_extra_obs = ik_info_merge_to_extra_obs
+        self.ik_info_enable = ik_info_enable
+        if (not self.ik_info_enable) and self.ik_info_merge_to_extra_obs:
+            warn("将 policy 信息合并到 extra obs 前需要启用 policy_info_enable")
+            self.ik_info_merge_to_extra_obs = False
+
         self.policy_info_enable = policy_info_enable
         self.policy_bc_policy_mode = policy_bc_policy_mode
         self.policy_show_goal_axis = policy_show_goal_axis
@@ -1834,6 +1862,10 @@ class SequentialTaskEnv(SceneManipulationEnv):
         if self.policy_info_enable:
             policy_info = self._policy_evaluate()
             origin_info.update(policy_info)
+
+        if self.ik_info_enable:
+            ik_info = self._ik_evaluate()
+            origin_info.update(ik_info)
 
         if self.receptacles_enable:
             target_receptacles = self._get_current_target_receptacles_info()
@@ -2645,6 +2677,7 @@ class SequentialTaskEnv(SceneManipulationEnv):
                     pi0_eef_ref_action = info["pi0_eef_ref_action"],
                     pi0_eef_abs_action = info["pi0_eef_abs_action"],
                 ))
+
         if self.policy_info_merge_to_extra_obs and self.policy_info_enable:
             origin_extra_obs.update(dict(
                 qpos = info["qpos"],
@@ -2665,6 +2698,11 @@ class SequentialTaskEnv(SceneManipulationEnv):
                     base_forward = info["base_forward"],
                     base2goal_vec = info["base2goal_vec"],
                 ))
+        if self.ik_info_merge_to_extra_obs and self.ik_info_enable:
+            origin_extra_obs.update(dict(
+                base_pose_wrt_world = info["base_pose_wrt_world"],
+                eef_pose_wrt_world = info["eef_pose_wrt_world"],
+            ))
 
         return origin_extra_obs
 
